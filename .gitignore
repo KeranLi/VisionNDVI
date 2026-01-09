@@ -1,0 +1,4 @@
+# 忽略模型权重文件和目录
+
+datasets/
+checkpoints/
