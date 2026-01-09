@@ -6,6 +6,9 @@ import torch.nn.functional as F
 import random
 import json
 from datetime import datetime
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import pandas as pd
 
 # ==================== Configuration ====================
 TARGET_SHAPE = (2154, 4320)
@@ -184,3 +187,202 @@ def calculate_metrics(pred, actual, mask=None):
         'rmse': rmse,
         'r2': r2
     }
+
+def run_inference(model, dataloader, device, output_dir, denormalize_output=True, stats=None, adapter=None):
+    """Run inference and save predictions with optional adapter"""
+    os.makedirs(output_dir, exist_ok=True)
+    predictions = []
+    file_paths = []
+    
+    with torch.no_grad():
+        for batch_idx, (features, _, file_path) in enumerate(tqdm(dataloader, desc="Inference")):
+            features = features.to(device)
+            
+            # Forward pass through the model
+            with torch.cuda.amp.autocast():
+                outputs = model(features)
+            
+            # If adapter is provided, pass the output through the adapter
+            if adapter:
+                outputs = adapter(outputs)
+            
+            # Process each sample
+            for i in range(outputs.shape[0]):
+                pred = outputs[i].cpu().numpy()
+                
+                # Denormalize if requested
+                if denormalize_output and stats and 'NDVI_Monthly' in stats:
+                    pred = denormalize(torch.from_numpy(pred), 'NDVI_Monthly', stats).numpy()
+                
+                predictions.append(pred)
+                
+                # Save prediction
+                base_name = os.path.basename(file_path[i]).replace('.npy', '_pred.npy')
+                save_path = os.path.join(output_dir, base_name)
+                np.save(save_path, pred)
+                file_paths.append(file_path[i])
+    
+    print(f"Saved {len(predictions)} predictions to {output_dir}")
+    return predictions, file_paths
+
+def visualize_and_evaluate(predictions, file_paths, dataset, output_dir, stats, num_viz=10):
+    """Generate visualizations and evaluation metrics"""
+    viz_dir = os.path.join(output_dir, 'visualizations')
+    os.makedirs(viz_dir, exist_ok=True)
+    
+    metrics = []
+    
+    for i in tqdm(range(min(num_viz, len(predictions))), desc="Visualization & Evaluation"):
+        # Load actual label
+        features, actual, fp = dataset[i]
+        actual = actual.numpy()
+        pred = predictions[i]
+        
+        # Denormalize for visualization
+        if stats and 'NDVI_Monthly' in stats:
+            pred_viz = denormalize(torch.from_numpy(pred), 'NDVI_Monthly', stats).numpy()
+            actual_viz = denormalize(torch.from_numpy(actual), 'NDVI_Monthly', stats).numpy()
+        else:
+            pred_viz = pred
+            actual_viz = actual
+        
+        # Flatten the actual and predicted data to match the mask's shape
+        actual_viz = actual_viz.flatten()  # Flatten to 1D array
+        pred_viz = pred_viz.flatten()      # Flatten to 1D array
+        
+        # Create a mask based on valid data points (non-NaN, non-inf)
+        mask = np.isfinite(actual_viz) & (actual_viz != -100.0)  # Creating a mask for valid values
+        
+        # Calculate metrics
+        metric = calculate_metrics(pred_viz, actual_viz, mask)
+        metric['file'] = os.path.basename(fp)
+        metrics.append(metric)
+        
+        # Plot
+        fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+        im0 = axes[0].imshow(pred_viz.reshape(actual.shape), cmap='viridis', vmin=0, vmax=1)  # Reshape back for visualization
+        axes[0].set_title('Prediction')
+        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+        
+        im1 = axes[1].imshow(actual_viz.reshape(actual.shape), cmap='viridis', vmin=0, vmax=1)  # Reshape back for visualization
+        axes[1].set_title('Actual')
+        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+        
+        plt.suptitle(f'NDVI Prediction - {os.path.basename(fp)}', fontsize=16)
+        plt.tight_layout()
+        plt.savefig(os.path.join(viz_dir, f'viz_{i}.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    # Save metrics CSV
+    df = pd.DataFrame(metrics)
+    df.to_csv(os.path.join(output_dir, 'inference_metrics.csv'), index=False)
+    print(f"Metrics saved. Mean RMSE: {df['rmse'].mean():.4f}, Mean R²: {df['r2'].mean():.4f}")
+
+def split_image_into_blocks(batch_image, block_size=256):
+    """
+    Split a batch of images into smaller blocks.
+    Args:
+        batch_image (torch.Tensor): The input batch of images tensor of shape (batch_size, C, H, W).
+        block_size (int): The size of each block (e.g., 256 for 256x256 blocks).
+    Returns:
+        List of blocks (each block is a tensor of shape (batch_size, C, block_size, block_size)).
+    """
+    batch_size, C, H, W = batch_image.shape  # Ensure the input is a batch of images
+    blocks = []
+
+    # Iterate through the batch
+    for i in range(batch_size):
+        image = batch_image[i]
+        # Split each image into blocks
+        for h in range(0, H, block_size):
+            for w in range(0, W, block_size):
+                block = image[:, h:h+block_size, w:w+block_size]
+                blocks.append(block)
+
+    return blocks
+
+def run_inference_with_adapter(model, dataloader, device, output_dir, denormalize_output=True, stats=None, adapter=None, grid_size=30, accumulation_steps=4):
+    """Run inference with adapter and fine-tune a small grid of the image."""
+    os.makedirs(output_dir, exist_ok=True)
+    predictions = []
+    file_paths = []
+
+    optimizer = torch.optim.Adam(adapter.parameters(), lr=1e-3)  # We optimize the adapter parameters
+
+    model.eval()
+    adapter.train()  # Make sure the adapter is in training mode (since we need to adjust weights)
+
+    # Initialize the accumulation step counter
+    accumulation_counter = 0
+
+    with torch.no_grad():  # Disable gradients for inference
+        with torch.set_grad_enabled(True):  # Ensure gradients are enabled for backpropagation
+            for batch_idx, (features, _, file_path) in enumerate(tqdm(dataloader, desc="Inference")):
+                features = features.to(device)
+
+                # Step 1: Forward pass with the original model
+                with torch.cuda.amp.autocast():
+                    original_outputs = model(features)
+
+                # Ensure that the original_outputs are on the same device as the adapter
+                original_outputs = original_outputs.to(device)  # Make sure it's on the same device as the adapter
+                original_outputs = original_outputs.to(torch.float32)  # Force the dtype to be float32
+
+                # Check if the output is 3D (for example, single channel), and add an extra dimension for channels
+                if original_outputs.dim() == 3:  # (batch_size, height, width)
+                    original_outputs = original_outputs.unsqueeze(1)  # Add a channel dimension (batch_size, 1, height, width)
+
+                # Set requires_grad to True for original_outputs to enable gradient calculation
+                original_outputs.requires_grad_()  # Enable gradient calculation for original_outputs
+
+                # Step 2: Fine-tune only a small region of the output (30x30 grid)
+                if adapter:
+                    # Define the 30x30 grid (small section of the image)
+                    batch_size, channels, height, width = original_outputs.shape
+                    grid_start_x = (height - grid_size) // 2  # Calculate the top-left corner for the grid
+                    grid_start_y = (width - grid_size) // 2
+
+                    # Extract the 30x30 region from the output tensor
+                    small_grid = original_outputs[:, :, grid_start_x:grid_start_x+grid_size, grid_start_y:grid_start_y+grid_size]
+
+                    # Apply adapter to this small region
+                    adjusted_grid = adapter(small_grid)
+                    original_outputs[:, :, grid_start_x:grid_start_x+grid_size, grid_start_y:grid_start_y+grid_size] = adjusted_grid
+
+                # Step 3: Initialize adjusted_outputs before denormalizing
+                adjusted_outputs = original_outputs
+
+                # Denormalize if necessary
+                if denormalize_output and stats and 'NDVI_Monthly' in stats:
+                    adjusted_outputs = denormalize(original_outputs, 'NDVI_Monthly', stats)
+
+                # Collect results
+                predictions.append(adjusted_outputs.detach().cpu().numpy())  # Use detach() to avoid gradient tracking
+                for i in range(adjusted_outputs.shape[0]):
+                    base_name = os.path.basename(file_path[i]).replace('.npy', '_pred.npy')
+                    save_path = os.path.join(output_dir, base_name)
+                    np.save(save_path, adjusted_outputs[i].detach().cpu().numpy())  # Use detach() to avoid gradient tracking
+                    file_paths.append(file_path[i])
+
+                # Step 4: Optimize the adapter
+                # Flatten both adjusted_outputs and original_outputs to match shapes
+                adjusted_outputs_flat = adjusted_outputs.view(adjusted_outputs.size(0), -1)  # Flatten the output
+                original_outputs_flat = original_outputs.view(original_outputs.size(0), -1)  # Flatten the original output
+
+                # Now we can safely calculate the loss
+                loss = torch.nn.functional.mse_loss(adjusted_outputs_flat, original_outputs_flat)  # Calculate loss based on original predictions
+
+                # Perform backward pass
+                loss.backward()  # Compute gradients
+
+                # Perform gradient update every 'accumulation_steps' steps
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    optimizer.step()  # Update adapter's parameters
+                    optimizer.zero_grad()  # Zero the gradients
+                    torch.cuda.empty_cache()  # Clear cached memory after each batch
+
+                # Step 5: Clear the cache after each batch to avoid memory issues
+                torch.cuda.empty_cache()  # Clear cached memory after each batch
+
+    print(f"Saved {len(predictions)} predictions to {output_dir}")
+    return predictions, file_paths

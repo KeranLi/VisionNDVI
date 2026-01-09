@@ -1,0 +1,8 @@
+name: VisonNDVI
+channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/
+  - defaults
+dependencies:
+  - python=3.10
+prefix: F:\Anaconda3\envs\VisonNDVI

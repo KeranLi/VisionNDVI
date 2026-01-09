@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.adapter import InferenceAdapter  # Import InferenceAdapter
+
 class UNetEnhancedCNNModel(nn.Module):
     """UNet-based model for NDVI prediction"""
     def __init__(self, num_input_channels=6):
@@ -90,3 +92,7 @@ def load_model(checkpoint_path, device, use_dataparallel=False):
     print(f"Model loaded from {checkpoint_path}")
     return model
 
+def load_adapter(input_shape, device):
+    """Load and return the InferenceAdapter"""
+    adapter = InferenceAdapter(input_shape).to(device)
+    return adapter
