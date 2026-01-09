@@ -1,12 +1,12 @@
 
-# VisonNDVI
+# VisionNDVI
 
 > A script-driven repository for image/time-series processing and model training/inference (organized by scripts in the repository root directory: `tif2npy.py`, `inference.py`, various `train_OF_*.py` files, etc.).
 
 Repository: [@KeranLi/VisonNDVI](https://github.com/KeranLi/VisonNDVI)
 
 ## Table of Contents
-- [VisonNDVI](#visonndvi)
+- [VisionNDVI](#visonndvi)
   - [Table of Contents](#table-of-contents)
   - [Introduction](#introduction)
   - [Quick Start](#quick-start)
@@ -19,7 +19,7 @@ Repository: [@KeranLi/VisonNDVI](https://github.com/KeranLi/VisonNDVI)
 
 ## Introduction
 
-VisonNDVI is a codebase focused on image/time-series data processing and deep learning model training/inference (script-driven repository). The repository includes:
+VisionNDVI is a codebase focused on image/time-series data processing and deep learning model training/inference (script-driven repository). The repository includes:
 - **`tif2npy.py`**: Preprocessing script for converting GeoTIFF or raster images to NumPy format (for training/inference pipelines).
 - **`check_bad_npy.py`**: Script to check/repair corrupted or anomalous `.npy` files (e.g., missing values, inconsistent shapes).
 - **`train_OF_*.py`**: A set of scripts to train different model variants (e.g., CNN, UNet, 3D-CNN+MLP).
@@ -33,14 +33,14 @@ VisonNDVI is a codebase focused on image/time-series data processing and deep le
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/KeranLi/VisonNDVI.git
-   cd VisonNDVI
+   git clone https://github.com/KeranLi/VisionNDVI.git
+   cd VisionNDVI
    ```
 
 2. Create/install dependencies and activate the virtual environment:
    ```bash
-   conda env create -f environment.yml -n VisonNDVI
-   conda activate VisonNDVI
+   conda env create -f environment.yml -n VisionNDVI
+   conda activate VisionNDVI
    ```
 
 3. Run examples:
