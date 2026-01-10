@@ -48,3 +48,89 @@ class FineTuningAdapter(nn.Module):
         x = x.reshape(batch_size, channels, height, width)  # Reshape back to (batch_size, channels, height, width)
         
         return x
+
+
+class ResFineTuningAdapter(nn.Module):
+    def __init__(self, input_size, output_size=512, dropout_prob=0.5, weight_decay=1e-4):
+        super(ResFineTuningAdapter, self).__init__()
+        
+        # First fully connected layer (fc1)
+        self.fc1 = nn.Linear(input_size, 128, bias=False)
+        self.fc2 = nn.Linear(128, 256, bias=False)
+        self.fc3 = nn.Linear(256, 512, bias=False)
+        self.fc4 = nn.Linear(512, input_size, bias=False)  # Output size adjusted to match input size
+
+        # Dropout for regularization
+        self.dropout = nn.Dropout(p=dropout_prob)
+
+        # Residual connections
+        self.residual = nn.Linear(input_size, input_size, bias=False)
+
+    def forward(self, x):
+        # Ensure the input tensor is on the same device as the model's parameters
+        x = x.to(self.fc1.weight.device)  # Ensure input tensor is on the same device as the model's parameters
+
+        # Flatten the input tensor to (batch_size, channels * height * width)
+        batch_size, channels, height, width = x.size()
+        x_flat = x.reshape(batch_size, -1)  # Flatten to (batch_size, channels * height * width)
+
+        # First fully connected layer with ReLU and dropout
+        x = torch.relu(self.fc1(x_flat))
+        x = self.dropout(x)  # Dropout layer for regularization
+        
+        # Second fully connected layer with ReLU and dropout
+        x = torch.relu(self.fc2(x))
+        x = self.dropout(x)
+
+        # Third fully connected layer with ReLU and dropout
+        x = torch.relu(self.fc3(x))
+        x = self.dropout(x)
+
+        # Final layer to match the input size
+        x = self.fc4(x)
+
+        # Residual connection (skip connection)
+        residual = self.residual(x_flat)
+        x = x + residual  # Add residual to enhance gradient flow
+
+        # Reshape back to the original grid size
+        x = x.reshape(batch_size, channels, height, width)
+        
+        return x
+    
+import torch
+import torch.nn as nn
+
+class ConvResAdapter(nn.Module):
+    def __init__(self, in_channels=1, hidden_dim=32):
+        super(ConvResAdapter, self).__init__()
+        
+        # 卷积层：保持空间分辨率 (Padding=1, Kernel=3)
+        # 这样输入是 30x30，输出依然是 30x30
+        self.conv1 = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(hidden_dim, hidden_dim * 2, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=3, padding=1)
+        
+        # 最后一层将通道数还原回 in_channels (通常是 1)
+        self.conv4 = nn.Conv2d(hidden_dim, in_channels, kernel_size=3, padding=1)
+        
+        self.relu = nn.ReLU(inplace=True)
+        
+        # 如果你担心过拟合时数值爆炸，可以加入 BatchNorm
+        self.bn1 = nn.BatchNorm2d(hidden_dim)
+        self.bn2 = nn.BatchNorm2d(hidden_dim * 2)
+        self.bn3 = nn.BatchNorm2d(hidden_dim)
+
+    def forward(self, x):
+        # 记录原始输入，用于残差连接 (跳跃连接)
+        identity = x 
+        
+        # 卷积前向计算
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.relu(self.bn3(self.conv3(out)))
+        out = self.conv4(out)
+        
+        # 数值对齐的核心：UNet的粗略预测 + Adapter学习到的细节修正
+        # 形状完全一致: [Batch, 1, 30, 30] + [Batch, 1, 30, 30]
+        return out + identity
