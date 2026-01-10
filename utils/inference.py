@@ -289,7 +289,7 @@ def visualize_and_evaluate(predictions, file_paths, dataset, output_dir, stats, 
     
     # Save metrics CSV
     df = pd.DataFrame(metrics)
-    df.to_csv(os.path.join(output_dir, 'inference_metrics.csv'), index=False)
+    df.to_csv(os.path.join(output_dir, 'inference_metricsgit.csv'), index=False)
     print(f"Metrics saved. Mean RMSE: {df['rmse'].mean():.4f}, Mean R²: {df['r2'].mean():.4f}")
 
 def split_image_into_blocks(batch_image, block_size=256):

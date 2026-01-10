@@ -26,8 +26,10 @@ class FineTuningAdapter(nn.Module):
     def __init__(self, input_size, output_size=512):
         super(FineTuningAdapter, self).__init__()
         # Input size should match the flattened grid size (900 for 30x30 grid)
-        self.fc1 = nn.Linear(input_size, output_size, bias=False)
-        self.fc2 = nn.Linear(output_size, input_size, bias=False)  # Adjust output size to match input size
+        self.fc1 = nn.Linear(input_size, 64, bias=False)
+        self.fc2 = nn.Linear(64, 256, bias=False)
+        self.fc3 = nn.Linear(256, 512, bias=False)
+        self.fc4 = nn.Linear(512, input_size, bias=False)  # Adjust output size to match input size
 
     def forward(self, x):
         # Ensure the input tensor is on the same device as the model's parameters
@@ -38,7 +40,9 @@ class FineTuningAdapter(nn.Module):
         x = x.reshape(batch_size, -1)  # Use reshape to flatten to a 2D tensor: (batch_size, channels * height * width)
 
         x = torch.relu(self.fc1(x))  # Apply ReLU activation
-        x = self.fc2(x)  # Apply second fully connected layer
+        x = torch.relu(self.fc2(x))  # Apply ReLU activation
+        x = torch.relu(self.fc3(x))  # Apply ReLU activation
+        x = self.fc4(x)  # Apply second fully connected layer
         
         # Reshape back to the original grid size
         x = x.reshape(batch_size, channels, height, width)  # Reshape back to (batch_size, channels, height, width)
