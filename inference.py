@@ -2,7 +2,6 @@
 import os
 import argparse
 import torch
-import numpy as np
 from torch.utils.data import DataLoader
 
 # Import from modules
@@ -16,6 +15,10 @@ from utils.datasets import NDVIDataset
 from utils.inference import run_inference_with_adapter, visualize_and_evaluate  # Import functions from utils/inference
 from models.models import load_model, load_adapter
 from models.adapter import FineTuningAdapter
+
+import warnings
+
+warnings.filterwarnings("ignore")
 
 def main():
     parser = argparse.ArgumentParser(description='NDVI Prediction Inference')

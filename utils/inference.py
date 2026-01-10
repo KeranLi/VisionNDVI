@@ -75,7 +75,9 @@ def load_stats(stats_path):
     """Load normalization statistics from JSON file"""
     if os.path.exists(stats_path):
         with open(stats_path, 'r') as f:
-            return json.load(f)
+            stats = json.load(f)
+            print("Loaded stats:", stats)  # Debug print the loaded stats
+            return stats
     else:
         raise FileNotFoundError(f"Statistics file not found: {stats_path}")
 
@@ -94,7 +96,10 @@ def denormalize(tensor, cat, stats):
     """Denormalize predictions to original scale"""
     d_min = stats[cat]['min']
     d_max = stats[cat]['max']
-    return tensor * (d_max - d_min) + d_min
+    #print(f"Denormalizing for {cat}: Min = {d_min}, Max = {d_max}")
+    denorm_tensor = tensor * (d_max - d_min) + d_min
+    #print(f"Denormalized tensor min: {np.min(denorm_tensor)}, max: {np.max(denorm_tensor)}")
+    return denorm_tensor
 
 def read_npy(file_path, category, stats_dict=None, normalize=True):
     """
@@ -238,13 +243,8 @@ def visualize_and_evaluate(predictions, file_paths, dataset, output_dir, stats, 
         actual = actual.numpy()
         pred = predictions[i]
         
-        # Denormalize for visualization
-        if stats and 'NDVI_Monthly' in stats:
-            pred_viz = denormalize(torch.from_numpy(pred), 'NDVI_Monthly', stats).numpy()
-            actual_viz = denormalize(torch.from_numpy(actual), 'NDVI_Monthly', stats).numpy()
-        else:
-            pred_viz = pred
-            actual_viz = actual
+        pred_viz = pred  # No need to denormalize for NDVI
+        actual_viz = actual  # No need to denormalize for NDVI
         
         # Flatten the actual and predicted data to match the mask's shape
         actual_viz = actual_viz.flatten()  # Flatten to 1D array
@@ -258,19 +258,33 @@ def visualize_and_evaluate(predictions, file_paths, dataset, output_dir, stats, 
         metric['file'] = os.path.basename(fp)
         metrics.append(metric)
         
+        # Dynamically set the vmin and vmax for color scale based on data
+        vmin = min(np.min(actual_viz), np.min(pred_viz))
+        vmax = max(np.max(actual_viz), np.max(pred_viz))
+
         # Plot
-        fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-        im0 = axes[0].imshow(pred_viz.reshape(actual.shape), cmap='viridis', vmin=0, vmax=1)  # Reshape back for visualization
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+        im0 = axes[0].imshow(pred_viz.reshape(actual.shape), cmap='viridis', vmin=vmin, vmax=vmax)  # Reshape back for visualization
         axes[0].set_title('Prediction')
-        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-        
-        im1 = axes[1].imshow(actual_viz.reshape(actual.shape), cmap='viridis', vmin=0, vmax=1)  # Reshape back for visualization
+
+        # Remove the coordinate axes and borders
+        axes[0].axis('off')
+
+        # The color bar controls the length. Reduce the fraction to make it shorter
+        plt.colorbar(im0, ax=axes[0], fraction=0.025, pad=0.04)
+
+        im1 = axes[1].imshow(actual_viz.reshape(actual.shape), cmap='viridis', vmin=vmin, vmax=vmax)  # Reshape back for visualization
         axes[1].set_title('Actual')
-        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-        
-        plt.suptitle(f'NDVI Prediction - {os.path.basename(fp)}', fontsize=16)
+
+        # Remove the coordinate axes and borders
+        axes[1].axis('off')
+
+        # The color bar controls the length. Reduce the fraction to make it shorter
+        plt.colorbar(im1, ax=axes[1], fraction=0.025, pad=0.04)
+
+        #plt.suptitle(f'NDVI Prediction - {os.path.basename(fp)}', fontsize=12)
         plt.tight_layout()
-        plt.savefig(os.path.join(viz_dir, f'viz_{i}.png'), dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(viz_dir, f'viz_NDVI_Prediction_{os.path.basename(fp)}.png'), dpi=300, bbox_inches='tight')
         plt.close()
     
     # Save metrics CSV
