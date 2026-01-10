@@ -6,7 +6,7 @@
 Repository: [@KeranLi/VisonNDVI](https://github.com/KeranLi/VisonNDVI)
 
 ## Table of Contents
-- [VisionNDVI](#visonndvi)
+- [VisionNDVI](#visionndvi)
   - [Table of Contents](#table-of-contents)
   - [Introduction](#introduction)
   - [Quick Start](#quick-start)

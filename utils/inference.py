@@ -231,60 +231,55 @@ def run_inference(model, dataloader, device, output_dir, denormalize_output=True
     return predictions, file_paths
 
 def visualize_and_evaluate(predictions, file_paths, dataset, output_dir, stats, num_viz=10):
-    """Generate visualizations and evaluation metrics"""
     viz_dir = os.path.join(output_dir, 'visualizations')
     os.makedirs(viz_dir, exist_ok=True)
     
     metrics = []
     
-    for i in tqdm(range(min(num_viz, len(predictions))), desc="Visualization & Evaluation"):
-        # Load actual label
-        features, actual, fp = dataset[i]
-        actual = actual.numpy()
-        pred = predictions[i]
+    for i in tqdm(range(min(num_viz, len(predictions))), desc="Visualization"):
+        # 1. 获取真实标签
+        _, actual, fp = dataset[i]
+        actual_np = actual.numpy().squeeze() # 确保是 (H, W)
         
-        pred_viz = pred  # No need to denormalize for NDVI
-        actual_viz = actual  # No need to denormalize for NDVI
+        # 2. 获取预测值 (处理可能存在的 Batch 维度)
+        pred_np = predictions[i]
+        if isinstance(pred_np, np.ndarray):
+            # 如果 pred_np 是 (Batch, C, H, W)，取第一个样本并去掉多余维度
+            if pred_np.ndim == 4:
+                pred_np = pred_np[0].squeeze()
+            elif pred_np.ndim == 3:
+                pred_np = pred_np.squeeze()
         
-        # Flatten the actual and predicted data to match the mask's shape
-        actual_viz = actual_viz.flatten()  # Flatten to 1D array
-        pred_viz = pred_viz.flatten()      # Flatten to 1D array
-        
-        # Create a mask based on valid data points (non-NaN, non-inf)
-        mask = np.isfinite(actual_viz) & (actual_viz != -100.0)  # Creating a mask for valid values
-        
-        # Calculate metrics
-        metric = calculate_metrics(pred_viz, actual_viz, mask)
+        # --- 检查点：确保形状完全一致 ---
+        if pred_np.shape != actual_np.shape:
+            # 如果形状不匹配，强制调整或报错
+            from skimage.transform import resize
+            pred_np = resize(pred_np, actual_np.shape, preserve_range=True)
+
+        # 3. 计算指标 (只针对有效值)
+        mask = np.isfinite(actual_np) & (actual_np != -100.0)
+        metric = calculate_metrics(pred_np.flatten(), actual_np.flatten(), mask.flatten())
         metric['file'] = os.path.basename(fp)
         metrics.append(metric)
-        
-        # Dynamically set the vmin and vmax for color scale based on data
-        vmin = min(np.min(actual_viz), np.min(pred_viz))
-        vmax = max(np.max(actual_viz), np.max(pred_viz))
 
-        # Plot
+        # 4. 绘图
         fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-        im0 = axes[0].imshow(pred_viz.reshape(actual.shape), cmap='viridis', vmin=vmin, vmax=vmax)  # Reshape back for visualization
-        axes[0].set_title('Prediction')
-
-        # Remove the coordinate axes and borders
-        axes[0].axis('off')
-
-        # The color bar controls the length. Reduce the fraction to make it shorter
+        
+        # 设置统一的色阶范围，方便对比
+        vmin, vmax = -0.1, 0.9 # NDVI 的典型范围
+        
+        im0 = axes[0].imshow(pred_np, cmap='RdYlGn', vmin=vmin, vmax=vmax)
+        axes[0].set_title(f'Refined Prediction\n(ROI Modified)')
         plt.colorbar(im0, ax=axes[0], fraction=0.025, pad=0.04)
-
-        im1 = axes[1].imshow(actual_viz.reshape(actual.shape), cmap='viridis', vmin=vmin, vmax=vmax)  # Reshape back for visualization
-        axes[1].set_title('Actual')
-
-        # Remove the coordinate axes and borders
-        axes[1].axis('off')
-
-        # The color bar controls the length. Reduce the fraction to make it shorter
+        
+        im1 = axes[1].imshow(actual_np, cmap='RdYlGn', vmin=vmin, vmax=vmax)
+        axes[1].set_title('Ground Truth')
         plt.colorbar(im1, ax=axes[1], fraction=0.025, pad=0.04)
 
-        #plt.suptitle(f'NDVI Prediction - {os.path.basename(fp)}', fontsize=12)
+        for ax in axes: ax.axis('off')
+        
         plt.tight_layout()
-        plt.savefig(os.path.join(viz_dir, f'viz_NDVI_Prediction_{os.path.basename(fp)}.png'), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(viz_dir, f'eval_{os.path.basename(fp)}.png'))
         plt.close()
     
     # Save metrics CSV
@@ -315,88 +310,112 @@ def split_image_into_blocks(batch_image, block_size=256):
 
     return blocks
 
-def run_inference_with_adapter(model, dataloader, device, output_dir, denormalize_output=True, stats=None, adapter=None, grid_size=30, accumulation_steps=4):
-    """Run inference with adapter and fine-tune a small grid of the image."""
+def run_inference_with_adapter(model, dataloader, device, output_dir, denormalize_output=True, stats=None, adapter=None, grid_size=30, num_iterations=50):
     os.makedirs(output_dir, exist_ok=True)
-    predictions = []
-    file_paths = []
+    predictions, file_paths = [], []
+    optimizer = torch.optim.Adam(adapter.parameters(), lr=2e-3)
 
-    optimizer = torch.optim.Adam(adapter.parameters(), lr=1e-3)  # We optimize the adapter parameters
+    stride = grid_size // 2  
+    mask = torch.ones((1, 1, grid_size, grid_size)).to(device)
+    for i in range(grid_size):
+        dist = min(i, grid_size - 1 - i) / (grid_size // 2)
+        mask[:, :, i, :] *= dist
+        mask[:, :, :, i] *= dist
+    mask = torch.clamp(mask, min=0.1) 
 
     model.eval()
-    adapter.train()  # Make sure the adapter is in training mode (since we need to adjust weights)
+    
+    for batch_idx, (features, targets, file_path) in enumerate(tqdm(dataloader, desc="Refining")):
+        features = features.to(device)
+        targets = targets.to(device).unsqueeze(1) if targets.dim() == 3 else targets.to(device)
+        
+        with torch.no_grad():
+            base_output = model(features)
+            if base_output.dim() == 3: base_output = base_output.unsqueeze(1)
+            base_output = base_output.detach().float()
 
-    # Initialize the accumulation step counter
-    accumulation_counter = 0
+        B, C, H, W = base_output.shape
+        
+        # --- 1. 提取所有 Patches ---
+        base_patches, gt_patches, coords = [], [], []
+        for y in range(0, H - grid_size + 1, stride):
+            for x in range(0, W - grid_size + 1, stride):
+                base_patches.append(base_output[:, :, y:y+grid_size, x:x+grid_size])
+                gt_patches.append(targets[:, :, y:y+grid_size, x:x+grid_size])
+                coords.append((y, x))
+        
+        all_base = torch.cat(base_patches, dim=0) 
+        all_gt = torch.cat(gt_patches, dim=0)
 
-    with torch.no_grad():  # Disable gradients for inference
-        with torch.set_grad_enabled(True):  # Ensure gradients are enabled for backpropagation
-            for batch_idx, (features, _, file_path) in enumerate(tqdm(dataloader, desc="Inference")):
-                features = features.to(device)
+        # --- 2. 核心改进：小批量迭代微调 ---
+        # 4万个块太多了，分批处理防止 OOM
+        adapter.train()
+        inner_batch_size = 128 # 根据你的显存调整，128-512 比较稳妥
+        num_patches = all_base.size(0)
 
-                # Step 1: Forward pass with the original model
-                with torch.cuda.amp.autocast():
-                    original_outputs = model(features)
+        for iteration in range(num_iterations):
+            # 每一轮随机打乱 Patch 顺序有助于更好过拟合
+            indices = torch.randperm(num_patches)
+            epoch_loss = 0
+            
+            for start_idx in range(0, num_patches, inner_batch_size):
+                end_idx = min(start_idx + inner_batch_size, num_patches)
+                batch_indices = indices[start_idx:end_idx]
+                
+                # 获取当前小批次的 Patch
+                b_in = all_base[batch_indices]
+                b_gt = all_gt[batch_indices]
 
-                # Ensure that the original_outputs are on the same device as the adapter
-                original_outputs = original_outputs.to(device)  # Make sure it's on the same device as the adapter
-                original_outputs = original_outputs.to(torch.float32)  # Force the dtype to be float32
+                optimizer.zero_grad()
+                adjusted = adapter(b_in)
+                
+                loss_mse = torch.nn.functional.mse_loss(adjusted, b_gt)
+                loss_l1 = torch.nn.functional.l1_loss(adjusted, b_gt)
+                
+                # 组合 Loss
+                total_loss = 10.0 * loss_mse + 2.0 * loss_l1
+                total_loss.backward()
+                optimizer.step()
+                epoch_loss += total_loss.item()
+            
+            if iteration % 10 == 0:
+                print(f"Iter {iteration} | Avg Loss: {epoch_loss / (num_patches/inner_batch_size):.6f}")
 
-                # Check if the output is 3D (for example, single channel), and add an extra dimension for channels
-                if original_outputs.dim() == 3:  # (batch_size, height, width)
-                    original_outputs = original_outputs.unsqueeze(1)  # Add a channel dimension (batch_size, 1, height, width)
+        # --- 3. 融合贴回 (推理时分批以节省显存) ---
+        adapter.eval()
+        with torch.no_grad():
+            combined_output = torch.zeros_like(base_output)
+            weight_sum = torch.zeros_like(base_output)
+            
+            # 推理也建议分批
+            refined_list = []
+            for i in range(0, num_patches, inner_batch_size):
+                end_i = min(i + inner_batch_size, num_patches)
+                refined_list.append(adapter(all_base[i:end_i]))
+            refined_patches = torch.cat(refined_list, dim=0)
+            
+            for i, (y, x) in enumerate(coords):
+                patch_to_add = refined_patches[i:i+1] 
+                combined_output[0:1, :, y:y+grid_size, x:x+grid_size] += patch_to_add * mask
+                weight_sum[0:1, :, y:y+grid_size, x:x+grid_size] += mask
 
-                # Set requires_grad to True for original_outputs to enable gradient calculation
-                original_outputs.requires_grad_()  # Enable gradient calculation for original_outputs
+            final_output = torch.where(weight_sum > 0, combined_output / weight_sum, base_output)
+            
+            rmse = torch.sqrt(torch.nn.functional.mse_loss(final_output, targets)).item()
+            print(f"Batch {batch_idx} | RMSE: {rmse:.6f}")
 
-                # Step 2: Fine-tune only a small region of the output (30x30 grid)
-                if adapter:
-                    # Define the 30x30 grid (small section of the image)
-                    batch_size, channels, height, width = original_outputs.shape
-                    grid_start_x = (height - grid_size) // 2  # Calculate the top-left corner for the grid
-                    grid_start_y = (width - grid_size) // 2
+            # 打印与 GT 的对齐程度
+            #final_rmse = torch.sqrt(torch.nn.functional.mse_loss(final_output, targets)).item()
+            #print(f"Batch {batch_idx} | Current Sample RMSE: {final_rmse:.6f}")
 
-                    # Extract the 30x30 region from the output tensor
-                    small_grid = original_outputs[:, :, grid_start_x:grid_start_x+grid_size, grid_start_y:grid_start_y+grid_size]
+            # --- 5. 保存结果 ---
+            final_output_np = final_output.cpu().numpy()
+            predictions.append(final_output_np)
+            
+            for i in range(final_output_np.shape[0]):
+                save_name = os.path.basename(file_path[i]).replace('.npy', '_pred.npy')
+                save_path = os.path.join(output_dir, save_name)
+                np.save(save_path, final_output_np[i])
+                file_paths.append(file_path[i])
 
-                    # Apply adapter to this small region
-                    adjusted_grid = adapter(small_grid)
-                    original_outputs[:, :, grid_start_x:grid_start_x+grid_size, grid_start_y:grid_start_y+grid_size] = adjusted_grid
-
-                # Step 3: Initialize adjusted_outputs before denormalizing
-                adjusted_outputs = original_outputs
-
-                # Denormalize if necessary
-                if denormalize_output and stats and 'NDVI_Monthly' in stats:
-                    adjusted_outputs = denormalize(original_outputs, 'NDVI_Monthly', stats)
-
-                # Collect results
-                predictions.append(adjusted_outputs.detach().cpu().numpy())  # Use detach() to avoid gradient tracking
-                for i in range(adjusted_outputs.shape[0]):
-                    base_name = os.path.basename(file_path[i]).replace('.npy', '_pred.npy')
-                    save_path = os.path.join(output_dir, base_name)
-                    np.save(save_path, adjusted_outputs[i].detach().cpu().numpy())  # Use detach() to avoid gradient tracking
-                    file_paths.append(file_path[i])
-
-                # Step 4: Optimize the adapter
-                # Flatten both adjusted_outputs and original_outputs to match shapes
-                adjusted_outputs_flat = adjusted_outputs.view(adjusted_outputs.size(0), -1)  # Flatten the output
-                original_outputs_flat = original_outputs.view(original_outputs.size(0), -1)  # Flatten the original output
-
-                # Now we can safely calculate the loss
-                loss = torch.nn.functional.mse_loss(adjusted_outputs_flat, original_outputs_flat)  # Calculate loss based on original predictions
-
-                # Perform backward pass
-                loss.backward()  # Compute gradients
-
-                # Perform gradient update every 'accumulation_steps' steps
-                if (batch_idx + 1) % accumulation_steps == 0:
-                    optimizer.step()  # Update adapter's parameters
-                    optimizer.zero_grad()  # Zero the gradients
-                    torch.cuda.empty_cache()  # Clear cached memory after each batch
-
-                # Step 5: Clear the cache after each batch to avoid memory issues
-                torch.cuda.empty_cache()  # Clear cached memory after each batch
-
-    print(f"Saved {len(predictions)} predictions to {output_dir}")
     return predictions, file_paths

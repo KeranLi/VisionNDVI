@@ -14,7 +14,7 @@ from utils.helpers import (
 from utils.datasets import NDVIDataset
 from utils.inference import run_inference_with_adapter, visualize_and_evaluate  # Import functions from utils/inference
 from models.models import load_model, load_adapter
-from models.adapter import FineTuningAdapter
+from models.adapter import FineTuningAdapter, ResFineTuningAdapter, ConvResAdapter
 
 import warnings
 
@@ -97,13 +97,15 @@ def main():
     
     # Load adapter (for fine-tuning)
     input_shape = 30 * 30  # Adjust this value based on your model's output shape
-    adapter = FineTuningAdapter(input_size=input_shape)  # Use FineTuningAdapter with correct input size
+    #adapter = FineTuningAdapter(input_size=input_shape)  # Use FineTuningAdapter with correct input size
+    #adapter = ResFineTuningAdapter(input_size=input_shape)
+    adapter = ConvResAdapter()
     adapter.to(device)  # Ensure it's on the correct device
     
     # Run inference with adapter
     pred_dir = os.path.join(args.output_dir, 'predictions')
     predictions, file_paths = run_inference_with_adapter(model, dataloader, device, pred_dir, args.denormalize, stats, adapter=adapter)
-    
+
     # Visualize and evaluate if requested
     if args.visualize:
         print("Generating visualizations and metrics...")

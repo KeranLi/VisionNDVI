@@ -20,6 +20,7 @@
 ### Added
 
 - Fixed some bugs in denormalization and visualization.
+- Add Residual convolution Adapter
 
 ### Known Issues
 
