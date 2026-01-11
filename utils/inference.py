@@ -310,7 +310,33 @@ def split_image_into_blocks(batch_image, block_size=256):
 
     return blocks
 
-def run_inference_with_adapter(model, dataloader, device, output_dir, denormalize_output=True, stats=None, adapter=None, grid_size=30, num_iterations=50):
+def save_residual_map(prediction, ground_truth, save_path, filename):
+    """
+    计算并保存残差图：Residual = Prediction - Ground Truth
+    """
+    # 确保维度一致 [H, W]
+    pred = prediction.squeeze()
+    gt = ground_truth.squeeze()
+    
+    # 计算残差
+    residual = pred - gt
+    
+    # 1. 保存为原始数值文件 (.npy)，便于后续定量统计指标分析
+    np.save(os.path.join(save_path, f"{filename}_residual.npy"), residual)
+    
+    # 2. (可选) 保存为可视化图片，直观观察空间误差分布
+    # 红色代表预测偏高，蓝色代表预测偏低，白色代表准确
+    plt.figure(figsize=(10, 8))
+    plt.imshow(residual, cmap='coolwarm', vmin=-0.2, vmax=0.2) # NDVI残差通常在这个范围
+    plt.colorbar(label='Residual (Pred - GT)')
+    plt.title(f'Residual Map: {filename}')
+    plt.axis('off')
+    plt.savefig(os.path.join(save_path, f"{filename}_residual_viz.png"), bbox_inches='tight')
+    plt.close()
+
+    return residual.mean(), np.abs(residual).mean() # 返回偏置和MAE供参考
+
+def run_inference_with_adapter(model, dataloader, device, output_dir, denormalize_output=True, stats=None, adapter=None, grid_size=30, num_iterations=500):
     os.makedirs(output_dir, exist_ok=True)
     predictions, file_paths = [], []
     optimizer = torch.optim.Adam(adapter.parameters(), lr=2e-3)
@@ -378,8 +404,8 @@ def run_inference_with_adapter(model, dataloader, device, output_dir, denormaliz
                 optimizer.step()
                 epoch_loss += total_loss.item()
             
-            if iteration % 10 == 0:
-                print(f"Iter {iteration} | Avg Loss: {epoch_loss / (num_patches/inner_batch_size):.6f}")
+            #if iteration % 10 == 0:
+                #print(f"Iter {iteration} | Avg Loss: {epoch_loss / (num_patches/inner_batch_size):.6f}")
 
         # --- 3. 融合贴回 (推理时分批以节省显存) ---
         adapter.eval()
@@ -401,8 +427,8 @@ def run_inference_with_adapter(model, dataloader, device, output_dir, denormaliz
 
             final_output = torch.where(weight_sum > 0, combined_output / weight_sum, base_output)
             
-            rmse = torch.sqrt(torch.nn.functional.mse_loss(final_output, targets)).item()
-            print(f"Batch {batch_idx} | RMSE: {rmse:.6f}")
+            #rmse = torch.sqrt(torch.nn.functional.mse_loss(final_output, targets)).item()
+            #print(f"Batch {batch_idx} | RMSE: {rmse:.6f}")
 
             # 打印与 GT 的对齐程度
             #final_rmse = torch.sqrt(torch.nn.functional.mse_loss(final_output, targets)).item()
@@ -413,9 +439,21 @@ def run_inference_with_adapter(model, dataloader, device, output_dir, denormaliz
             predictions.append(final_output_np)
             
             for i in range(final_output_np.shape[0]):
-                save_name = os.path.basename(file_path[i]).replace('.npy', '_pred.npy')
-                save_path = os.path.join(output_dir, save_name)
-                np.save(save_path, final_output_np[i])
-                file_paths.append(file_path[i])
+                base_name = os.path.basename(file_path[i]).replace('.npy', '')
+                
+                # 保存预测结果
+                save_path_pred = os.path.join(output_dir, f"{base_name}_pred.npy")
+                np.save(save_path_pred, final_output_np[i])
+                
+                # --- 新增：残差计算与保存 ---
+                # 这里的 targets 是你在微调时用的 GT
+                gt_np = targets[i].cpu().numpy()
+                residual = final_output_np[i] - gt_np
+                
+                save_path_res = os.path.join(output_dir, f"{base_name}_residual.npy")
+                np.save(save_path_res, residual)
+                
+                # 统计一下当前样本的平均残差，看看有没有系统性偏差
+                print(f"Sample {base_name} | Bias: {residual.mean():.6f}")
 
     return predictions, file_paths
