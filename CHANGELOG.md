@@ -14,7 +14,6 @@
 - Stage 2 introduces an Adapter to perform both numerical fine-tuning and inference.
 - The structure and hyperparameters of the Adapter have not yet been finalized for experiments.
 
-
 ## [1.0.0] - 2026-01-10
 
 ### Added
@@ -25,3 +24,24 @@
 ### Known Issues
 
 - NDVI ranges between 0 and 1. Denormalization is not a must.
+
+## [1.0.0] - 2026-01-11
+
+### Added
+
+- Fixed and added Adapters with residual and convolutions. 
+- Add Residual convolution Adapter.
+
+### Known Issues
+
+- Convolutions are the best.
+
+## [1.0.0] - 2026-01-12
+
+### Added
+
+- Residual (Prediction - Actual) visulizayion maps.
+
+### Known Issues
+
+- Seems the residual is related the spatial patterns.
