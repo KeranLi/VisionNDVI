@@ -310,33 +310,34 @@ def split_image_into_blocks(batch_image, block_size=256):
 
     return blocks
 
-def save_residual_map(prediction, ground_truth, save_path, filename):
+def save_residual_map(prediction, ground_truth, output_dir, base_name):
     """
-    计算并保存残差图：Residual = Prediction - Ground Truth
+    计算残差并保存。残差 = 预测 - 真值
     """
-    # 确保维度一致 [H, W]
+    # 确保是 2D 形状 [H, W]
     pred = prediction.squeeze()
     gt = ground_truth.squeeze()
-    
-    # 计算残差
     residual = pred - gt
     
-    # 1. 保存为原始数值文件 (.npy)，便于后续定量统计指标分析
-    np.save(os.path.join(save_path, f"{filename}_residual.npy"), residual)
+    # 1. 保存数值，用于后续定量分析 RMSE, R2
+    res_path = os.path.join(output_dir, f"{base_name}_residual.npy")
+    np.save(res_path, residual)
     
-    # 2. (可选) 保存为可视化图片，直观观察空间误差分布
-    # 红色代表预测偏高，蓝色代表预测偏低，白色代表准确
-    plt.figure(figsize=(10, 8))
-    plt.imshow(residual, cmap='coolwarm', vmin=-0.2, vmax=0.2) # NDVI残差通常在这个范围
-    plt.colorbar(label='Residual (Pred - GT)')
-    plt.title(f'Residual Map: {filename}')
+    # 2. 自动化可视化：这对研究空间模式非常有帮助
+    plt.figure(figsize=(8, 6))
+    # 使用 coolwarm 色调，0值对应白色，正值为红，负值为蓝
+    # vmin/vmax 设置为 0.1 左右，因为 NDVI 细微偏差更有意义
+    im = plt.imshow(residual, cmap='coolwarm', vmin=-0.1, vmax=0.1)
+    plt.colorbar(im, ax=ax, fraction=0.025, pad=0.04)
+    plt.colorbar(im, label='Residual (Pred - GT)')
+    plt.title(f"Residual Map: {base_name}")
     plt.axis('off')
-    plt.savefig(os.path.join(save_path, f"{filename}_residual_viz.png"), bbox_inches='tight')
+    
+    viz_path = os.path.join(output_dir, f"{base_name}_residual_viz.png")
+    plt.savefig(viz_path, dpi=150, bbox_inches='tight')
     plt.close()
 
-    return residual.mean(), np.abs(residual).mean() # 返回偏置和MAE供参考
-
-def run_inference_with_adapter(model, dataloader, device, output_dir, denormalize_output=True, stats=None, adapter=None, grid_size=30, num_iterations=500):
+def run_inference_with_adapter(model, dataloader, device, output_dir, denormalize_output=True, stats=None, adapter=None, grid_size=30, num_iterations=50):
     os.makedirs(output_dir, exist_ok=True)
     predictions, file_paths = [], []
     optimizer = torch.optim.Adam(adapter.parameters(), lr=2e-3)
@@ -436,6 +437,7 @@ def run_inference_with_adapter(model, dataloader, device, output_dir, denormaliz
 
             # --- 5. 保存结果 ---
             final_output_np = final_output.cpu().numpy()
+            targets_np = targets.cpu().numpy()
             predictions.append(final_output_np)
             
             for i in range(final_output_np.shape[0]):
@@ -447,13 +449,18 @@ def run_inference_with_adapter(model, dataloader, device, output_dir, denormaliz
                 
                 # --- 新增：残差计算与保存 ---
                 # 这里的 targets 是你在微调时用的 GT
-                gt_np = targets[i].cpu().numpy()
-                residual = final_output_np[i] - gt_np
+                save_residual_map(
+                    prediction=final_output_np[i], 
+                    ground_truth=targets_np[i], 
+                    output_dir=output_dir, 
+                    base_name=base_name
+                )
                 
-                save_path_res = os.path.join(output_dir, f"{base_name}_residual.npy")
-                np.save(save_path_res, residual)
-                
-                # 统计一下当前样本的平均残差，看看有没有系统性偏差
-                print(f"Sample {base_name} | Bias: {residual.mean():.6f}")
+                file_paths.append(file_path[i])
+                predictions.append(final_output_np[i])
+
+            # 打印当前 Batch 的平均绝对残差，监控对齐精度
+            batch_mae = np.abs(final_output_np - targets_np).mean()
+            print(f"Batch {batch_idx} | Mean Absolute Residual: {batch_mae:.6f}")
 
     return predictions, file_paths
