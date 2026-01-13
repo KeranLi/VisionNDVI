@@ -9,6 +9,7 @@ from datetime import datetime
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import pandas as pd
+import seaborn as sns
 
 # ==================== Configuration ====================
 TARGET_SHAPE = (2154, 4320)
@@ -328,6 +329,7 @@ def save_residual_map(prediction, ground_truth, output_dir, base_name):
     # 使用 coolwarm 色调，0值对应白色，正值为红，负值为蓝
     # vmin/vmax 设置为 0.1 左右，因为 NDVI 细微偏差更有意义
     im = plt.imshow(residual, cmap='coolwarm', vmin=-0.1, vmax=0.1)
+    ax = plt.gca()
     plt.colorbar(im, ax=ax, fraction=0.025, pad=0.04)
     plt.colorbar(im, label='Residual (Pred - GT)')
     plt.title(f"Residual Map: {base_name}")
@@ -336,6 +338,57 @@ def save_residual_map(prediction, ground_truth, output_dir, base_name):
     viz_path = os.path.join(output_dir, f"{base_name}_residual_viz.png")
     plt.savefig(viz_path, dpi=150, bbox_inches='tight')
     plt.close()
+
+def save_residual_distribution(prediction, ground_truth, output_dir, base_name, mask_path='datasets/AWI-CM-1-1-MR/mask.npy'): # 新增 current_mask 参数
+        """
+        专门针对陆地像素统计残差分布，标注 μ 和 σ
+        """
+        # 1. 计算原始残差
+        residual_full = (prediction - ground_truth).flatten()
+        
+        # 2. 加载海洋掩码 (假设 1 为陆地, 0 为海洋)
+        # 如果 mask 很大，建议在外部加载好传进来，这里为了演示逻辑闭环写在内部
+        land_mask = np.load(mask_path).flatten()
+        
+        # 3. 核心步骤：只筛选出陆地部分的残差
+        # 确保 mask 长度与展平后的图像一致
+        land_residuals = residual_full[land_mask == 1]
+        
+        if len(land_residuals) == 0:
+            print(f"Warning: No land pixels found for {base_name}")
+            return
+
+        # 4. 计算陆地统计量
+        mu = np.mean(land_residuals)
+        sigma = np.std(land_residuals)
+        
+        # 5. 绘图
+        plt.figure(figsize=(10, 6))
+        
+        # 绘制直方图 (只包含陆地)
+        sns.histplot(land_residuals, bins=100, kde=True, color='teal', edgecolor='white', alpha=0.7)
+        
+        # 绘制 0 基准线
+        plt.axvline(x=0, color='red', linestyle='--', linewidth=1.5, label='Zero Error')
+        
+        # 在图中标注统计量
+        stats_text = f'$\mu_{{land}} = {mu:.6f}$\n$\sigma_{{land}} = {sigma:.6f}$'
+        plt.gca().text(0.95, 0.90, stats_text, transform=plt.gca().transAxes,
+                    fontsize=12, verticalalignment='top', horizontalalignment='right',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
+
+        plt.title(f'Land-Only Residual Distribution: {base_name}')
+        plt.xlabel('Residual (Pred - GT)')
+        plt.ylabel('Pixel Count')
+        
+        # 设置合理的 X 轴范围，过滤掉 0 值的海洋干扰后，
+        # 陆地分布的“宽度”会展现得非常清晰
+        plt.xlim(-0.2, 0.2) 
+        plt.grid(axis='y', alpha=0.3)
+        
+        dist_path = os.path.join(output_dir, f"{base_name}_residual_dist.png")
+        plt.savefig(dist_path, dpi=150, bbox_inches='tight')
+        plt.close()
 
 def run_inference_with_adapter(model, dataloader, device, output_dir, denormalize_output=True, stats=None, adapter=None, grid_size=30, num_iterations=50):
     os.makedirs(output_dir, exist_ok=True)
@@ -450,6 +503,14 @@ def run_inference_with_adapter(model, dataloader, device, output_dir, denormaliz
                 # --- 新增：残差计算与保存 ---
                 # 这里的 targets 是你在微调时用的 GT
                 save_residual_map(
+                    prediction=final_output_np[i], 
+                    ground_truth=targets_np[i], 
+                    output_dir=output_dir, 
+                    base_name=base_name
+                )
+
+                # 新增：生成并保存残差分布柱状图 (带 μ 和 σ 标注)
+                save_residual_distribution(
                     prediction=final_output_np[i], 
                     ground_truth=targets_np[i], 
                     output_dir=output_dir, 

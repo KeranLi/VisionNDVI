@@ -40,8 +40,18 @@
 
 ### Added
 
-- Residual (Prediction - Actual) visulizayion maps.
+- Residual (Prediction - Actual) visulization maps.
 
 ### Known Issues
 
 - Seems the residual is related the spatial patterns.
+
+## [1.0.0] - 2026-01-13
+
+### Added
+
+- Residual (Prediction - Actual) visulization distribution bars.
+
+### Known Issues
+
+- Note that during the distribution statistics, must mask the ocean. The land is "1" while the ocean is "0".
