@@ -55,3 +55,9 @@
 ### Known Issues
 
 - Note that during the distribution statistics, must mask the ocean. The land is "1" while the ocean is "0".
+
+## [1.0.0] - 2026-01-14
+
+### Known Issues
+
+- The 100-500 is the potential fine-tuning steps in stage 2.
