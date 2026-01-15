@@ -30,18 +30,15 @@ def main():
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--visualize', action='store_true')
     parser.add_argument('--denormalize', action='store_true')
-    parser.add_argument('--start_date', type=str, default='201501')
+    parser.add_argument('--start_date', type=str, default='198201')
     parser.add_argument('--num_viz', type=int, default=10)
-    parser.add_argument('--demo', action='store_true', help="Run inference on a demo set of 10 images")
+    parser.add_argument('--demo', action='store_false', help="Run inference on a demo set of 10 images")
     parser.add_argument('--adjustment_factor', type=float, default=0.1, help="Factor to adjust predictions")
 
     args = parser.parse_args()
 
     # Hardcode debug values
-    print("RUNNING IN DEBUG MODE")
-    args.dataset_dir = './datasets/AWI-CM-1-1-MR/'  # Change this to your actual path
-    args.start_date = '198201'
-    args.stats_file = 'training_stats.json'
+    print("RUNNING")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_random_seeds(42)
@@ -87,8 +84,10 @@ def main():
 
     # If demo mode is activated, limit dataset to 10 samples
     if args.demo:
+        print(f"DEMO MODE: Processing only the first 10 samples.")
         dataset = torch.utils.data.Subset(dataset, range(10))  # in demo, only 10 samples were displayed
-    
+    else:
+        print(f"FULL INFERENCE MODE: Processing all {len(dataset)} samples.")
     # Create DataLoader
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
