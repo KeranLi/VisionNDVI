@@ -459,7 +459,7 @@ def run_inference_with_adapter(
         all_gt = torch.cat(gt_patches, dim=0)
         all_mask = torch.cat(mask_patches, dim=0) # [N, 1, 30, 30]
 
-        # --- 2. 核心改进：带掩码的小批量迭代微调 ---
+        # --- 2. 带掩码的小批量迭代微调 ---
         adapter.train()
         inner_batch_size = 128 
         num_patches = all_base.size(0)
@@ -477,18 +477,20 @@ def run_inference_with_adapter(
                 optimizer.zero_grad()
                 adjusted = adapter(b_in)
                 
-                # --- 关键：Loss 屏蔽海洋区域 ---
+                # --- Loss 屏蔽海洋区域 ---
                 # 只计算 b_mask == 1 的位置
                 mask_bool = (b_mask > 0.5) 
                 if mask_bool.sum() > 0: # 确保当前批次有陆地
                     loss_mse = torch.nn.functional.mse_loss(adjusted[mask_bool], b_gt[mask_bool])
                     loss_l1 = torch.nn.functional.l1_loss(adjusted[mask_bool], b_gt[mask_bool])
+                    penalty_under = torch.mean(torch.relu(-adjusted[mask_bool])**2) # 针对陆地像素，惩罚小于 0 的值
+                    penalty_over = torch.mean(torch.relu(adjusted[mask_bool] - 1.0)**2) # 针对陆地像素，惩罚大于 1 的值
                     
-                    total_loss = 10.0 * loss_mse + 2.0 * loss_l1
+                    total_loss = 10.0 * loss_mse + 2.0 * loss_l1 + 10.0 * (penalty_under + penalty_over)
                     total_loss.backward()
                     optimizer.step()
 
-        # --- 3. 融合贴回 ---
+        # --- 3. 融合 ---
         adapter.eval()
         with torch.no_grad():
             combined_output = torch.zeros_like(base_output)

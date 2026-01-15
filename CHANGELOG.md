@@ -61,3 +61,13 @@
 ### Known Issues
 
 - The 100-500 is the potential fine-tuning steps in stage 2.
+
+## [1.0.0] - 2026-01-15
+
+### Added
+
+- Add physical constraint loss for leaving the continental NDVI ranges between 0 and 1.
+
+### Known Issues
+
+- Performance improved 13.4%.
