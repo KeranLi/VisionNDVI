@@ -311,7 +311,12 @@ def split_image_into_blocks(batch_image, block_size=256):
 
     return blocks
 
-def save_residual_map(prediction, ground_truth, output_dir, base_name):
+def save_residual_map(
+        prediction,
+        ground_truth,
+        output_dir,
+        base_name
+    ):
     """
     计算残差并保存。残差 = 预测 - 真值
     """
@@ -339,7 +344,14 @@ def save_residual_map(prediction, ground_truth, output_dir, base_name):
     plt.savefig(viz_path, dpi=150, bbox_inches='tight')
     plt.close()
 
-def save_residual_distribution(prediction, ground_truth, output_dir, base_name, mask_path='datasets/AWI-CM-1-1-MR/mask.npy'): # 新增 current_mask 参数
+def save_residual_distribution(
+        prediction,
+        ground_truth,
+        output_dir,
+        base_name,
+        mask_path='datasets/AWI-CM-1-1-MR/mask.npy'
+        ): # 新增 current_mask 参数
+
         """
         专门针对陆地像素统计残差分布，标注 μ 和 σ
         """
@@ -390,18 +402,34 @@ def save_residual_distribution(prediction, ground_truth, output_dir, base_name, 
         plt.savefig(dist_path, dpi=150, bbox_inches='tight')
         plt.close()
 
-def run_inference_with_adapter(model, dataloader, device, output_dir, denormalize_output=True, stats=None, adapter=None, grid_size=30, num_iterations=100):
+def run_inference_with_adapter(
+        model,
+        dataloader,
+        device,
+        output_dir,
+        denormalize_output=True,
+        stats=None, adapter=None,
+        grid_size=30,
+        num_iterations=100,
+        mask_path='datasets/AWI-CM-1-1-MR/mask.npy'
+        ):
+    
     os.makedirs(output_dir, exist_ok=True)
     predictions, file_paths = [], []
     optimizer = torch.optim.Adam(adapter.parameters(), lr=2e-3)
 
+    # --- 加载全局掩码 ---
+    # 确保掩码在 GPU 上，形状为 [1, 1, H, W]
+    global_mask_np = np.load(mask_path)
+    global_mask = torch.from_numpy(global_mask_np).float().to(device).unsqueeze(0).unsqueeze(0)
+
     stride = grid_size // 2  
-    mask = torch.ones((1, 1, grid_size, grid_size)).to(device)
+    fusion_mask = torch.ones((1, 1, grid_size, grid_size)).to(device)
     for i in range(grid_size):
         dist = min(i, grid_size - 1 - i) / (grid_size // 2)
-        mask[:, :, i, :] *= dist
-        mask[:, :, :, i] *= dist
-    mask = torch.clamp(mask, min=0.1) 
+        fusion_mask[:, :, i, :] *= dist
+        fusion_mask[:, :, :, i] *= dist
+    fusion_mask = torch.clamp(fusion_mask, min=0.1) 
 
     model.eval()
     
@@ -415,59 +443,57 @@ def run_inference_with_adapter(model, dataloader, device, output_dir, denormaliz
             base_output = base_output.detach().float()
 
         B, C, H, W = base_output.shape
+        # 裁剪 mask 以匹配当前输出尺寸
+        curr_mask = global_mask[:, :, :H, :W]
         
         # --- 1. 提取所有 Patches ---
-        base_patches, gt_patches, coords = [], [], []
+        base_patches, gt_patches, mask_patches, coords = [], [], [], []
         for y in range(0, H - grid_size + 1, stride):
             for x in range(0, W - grid_size + 1, stride):
                 base_patches.append(base_output[:, :, y:y+grid_size, x:x+grid_size])
                 gt_patches.append(targets[:, :, y:y+grid_size, x:x+grid_size])
+                mask_patches.append(curr_mask[:, :, y:y+grid_size, x:x+grid_size]) # 提取掩码块
                 coords.append((y, x))
         
         all_base = torch.cat(base_patches, dim=0) 
         all_gt = torch.cat(gt_patches, dim=0)
+        all_mask = torch.cat(mask_patches, dim=0) # [N, 1, 30, 30]
 
-        # --- 2. 核心改进：小批量迭代微调 ---
-        # 4万个块太多了，分批处理防止 OOM
+        # --- 2. 核心改进：带掩码的小批量迭代微调 ---
         adapter.train()
-        inner_batch_size = 128 # 根据你的显存调整，128-512 比较稳妥
+        inner_batch_size = 128 
         num_patches = all_base.size(0)
 
         for iteration in range(num_iterations):
-            # 每一轮随机打乱 Patch 顺序有助于更好过拟合
             indices = torch.randperm(num_patches)
-            epoch_loss = 0
-            
             for start_idx in range(0, num_patches, inner_batch_size):
                 end_idx = min(start_idx + inner_batch_size, num_patches)
                 batch_indices = indices[start_idx:end_idx]
                 
-                # 获取当前小批次的 Patch
                 b_in = all_base[batch_indices]
                 b_gt = all_gt[batch_indices]
+                b_mask = all_mask[batch_indices] # 获取当前批次的掩码
 
                 optimizer.zero_grad()
                 adjusted = adapter(b_in)
                 
-                loss_mse = torch.nn.functional.mse_loss(adjusted, b_gt)
-                loss_l1 = torch.nn.functional.l1_loss(adjusted, b_gt)
-                
-                # 组合 Loss
-                total_loss = 10.0 * loss_mse + 2.0 * loss_l1
-                total_loss.backward()
-                optimizer.step()
-                epoch_loss += total_loss.item()
-            
-            #if iteration % 10 == 0:
-                #print(f"Iter {iteration} | Avg Loss: {epoch_loss / (num_patches/inner_batch_size):.6f}")
+                # --- 关键：Loss 屏蔽海洋区域 ---
+                # 只计算 b_mask == 1 的位置
+                mask_bool = (b_mask > 0.5) 
+                if mask_bool.sum() > 0: # 确保当前批次有陆地
+                    loss_mse = torch.nn.functional.mse_loss(adjusted[mask_bool], b_gt[mask_bool])
+                    loss_l1 = torch.nn.functional.l1_loss(adjusted[mask_bool], b_gt[mask_bool])
+                    
+                    total_loss = 10.0 * loss_mse + 2.0 * loss_l1
+                    total_loss.backward()
+                    optimizer.step()
 
-        # --- 3. 融合贴回 (推理时分批以节省显存) ---
+        # --- 3. 融合贴回 ---
         adapter.eval()
         with torch.no_grad():
             combined_output = torch.zeros_like(base_output)
             weight_sum = torch.zeros_like(base_output)
             
-            # 推理也建议分批
             refined_list = []
             for i in range(0, num_patches, inner_batch_size):
                 end_i = min(i + inner_batch_size, num_patches)
@@ -476,52 +502,49 @@ def run_inference_with_adapter(model, dataloader, device, output_dir, denormaliz
             
             for i, (y, x) in enumerate(coords):
                 patch_to_add = refined_patches[i:i+1] 
-                combined_output[0:1, :, y:y+grid_size, x:x+grid_size] += patch_to_add * mask
-                weight_sum[0:1, :, y:y+grid_size, x:x+grid_size] += mask
+                combined_output[0:1, :, y:y+grid_size, x:x+grid_size] += patch_to_add * fusion_mask
+                weight_sum[0:1, :, y:y+grid_size, x:x+grid_size] += fusion_mask
 
             final_output = torch.where(weight_sum > 0, combined_output / weight_sum, base_output)
             
-            #rmse = torch.sqrt(torch.nn.functional.mse_loss(final_output, targets)).item()
-            #print(f"Batch {batch_idx} | RMSE: {rmse:.6f}")
-
-            # 打印与 GT 的对齐程度
-            #final_rmse = torch.sqrt(torch.nn.functional.mse_loss(final_output, targets)).item()
-            #print(f"Batch {batch_idx} | Current Sample RMSE: {final_rmse:.6f}")
+            # --- 4. 预测后处理：强制归零海洋（防止微小抖动） ---
+            final_output = final_output * curr_mask 
 
             # --- 5. 保存结果 ---
             final_output_np = final_output.cpu().numpy()
             targets_np = targets.cpu().numpy()
-            predictions.append(final_output_np)
+            # 同样对 targets 做掩码，确保计算 MAE 时也是陆地
+            targets_masked_np = targets_np * curr_mask.cpu().numpy()
             
             for i in range(final_output_np.shape[0]):
                 base_name = os.path.basename(file_path[i]).replace('.npy', '')
                 
-                # 保存预测结果
                 save_path_pred = os.path.join(output_dir, f"{base_name}_pred.npy")
                 np.save(save_path_pred, final_output_np[i])
                 
-                # --- 新增：残差计算与保存 ---
-                # 这里的 targets 是你在微调时用的 GT
+                # 传入 mask_path 进行绘图过滤
                 save_residual_map(
                     prediction=final_output_np[i], 
-                    ground_truth=targets_np[i], 
+                    ground_truth=targets_masked_np[i], 
                     output_dir=output_dir, 
                     base_name=base_name
                 )
 
-                # 新增：生成并保存残差分布柱状图 (带 μ 和 σ 标注)
                 save_residual_distribution(
                     prediction=final_output_np[i], 
-                    ground_truth=targets_np[i], 
+                    ground_truth=targets_masked_np[i], 
                     output_dir=output_dir, 
-                    base_name=base_name
+                    base_name=base_name,
+                    mask_path=mask_path
                 )
                 
                 file_paths.append(file_path[i])
                 predictions.append(final_output_np[i])
 
-            # 打印当前 Batch 的平均绝对残差，监控对齐精度
-            batch_mae = np.abs(final_output_np - targets_np).mean()
-            print(f"Batch {batch_idx} | Mean Absolute Residual: {batch_mae:.6f}")
+            # 打印陆地 MAE
+            land_mask_idx = (curr_mask.cpu().numpy() > 0.5)
+            if land_mask_idx.any():
+                batch_mae = np.abs(final_output_np[land_mask_idx] - targets_np[land_mask_idx]).mean()
+                print(f"Batch {batch_idx} | Land MAE: {batch_mae:.6f}")
 
     return predictions, file_paths

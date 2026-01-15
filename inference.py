@@ -32,14 +32,14 @@ def main():
     parser.add_argument('--denormalize', action='store_true')
     parser.add_argument('--start_date', type=str, default='198201')
     parser.add_argument('--num_viz', type=int, default=10)
-    parser.add_argument('--demo', action='store_false', help="Run inference on a demo set of 10 images")
+    parser.add_argument('--demo', action='store_true', help="Run inference on a demo set of 10 images")
     parser.add_argument('--adjustment_factor', type=float, default=0.1, help="Factor to adjust predictions")
 
     args = parser.parse_args()
 
     # Hardcode debug values
     print("RUNNING")
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_random_seeds(42)
     
