@@ -390,7 +390,7 @@ def save_residual_distribution(prediction, ground_truth, output_dir, base_name, 
         plt.savefig(dist_path, dpi=150, bbox_inches='tight')
         plt.close()
 
-def run_inference_with_adapter(model, dataloader, device, output_dir, denormalize_output=True, stats=None, adapter=None, grid_size=30, num_iterations=5000):
+def run_inference_with_adapter(model, dataloader, device, output_dir, denormalize_output=True, stats=None, adapter=None, grid_size=30, num_iterations=100):
     os.makedirs(output_dir, exist_ok=True)
     predictions, file_paths = [], []
     optimizer = torch.optim.Adam(adapter.parameters(), lr=2e-3)
