@@ -71,3 +71,9 @@
 ### Known Issues
 
 - Performance improved 13.4%.
+
+## [1.0.0] - 2026-01-16
+
+### Added
+
+- Add TimeSpaceAdapter.
