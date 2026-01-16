@@ -134,3 +134,31 @@ class ConvResAdapter(nn.Module):
         # 数值对齐的核心：UNet的粗略预测 + Adapter学习到的细节修正
         # 形状完全一致: [Batch, 1, 30, 30] + [Batch, 1, 30, 30]
         return out + identity
+
+class TimeSpaceAdapter(nn.Module):
+    def __init__(self, channels=1):
+        super(TimeSpaceAdapter, self).__init__()
+        # 输入包括：当前预测值 + 上个月的残差 + (可选) 原始特征
+        self.conv1 = nn.Conv2d(2, 32, kernel_size=3, padding=1)
+        self.res_block = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        )
+        self.conv_out = nn.Conv2d(32, 1, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+
+    def forward(self, current_pred, last_residual=None):
+        if last_residual is None:
+            # 如果是序列第一个月，残差初始化为 0
+            last_residual = torch.zeros_like(current_pred)
+            
+        # 将当前预测和上月残差叠加作为输入
+        x = torch.cat([current_pred, last_residual], dim=1) 
+        
+        identity = current_pred
+        out = self.relu(self.conv1(x))
+        out = self.res_block(out)
+        delta = self.conv_out(out)
+        
+        return identity + delta
