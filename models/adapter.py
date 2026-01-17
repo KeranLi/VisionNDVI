@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class InferenceAdapter(nn.Module):
     def __init__(self, input_shape):
@@ -132,30 +133,70 @@ class ConvResAdapter(nn.Module):
         # 形状完全一致: [Batch, 1, 30, 30] + [Batch, 1, 30, 30]
         return out + identity
 
+class ResidualBlock(nn.Module):
+    """
+    一个标准的残差块，帮助深层网络更好收敛
+    """
+    def __init__(self, channels):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += residual
+        return F.relu(out)
+
 class TimeSpaceAdapter(nn.Module):
-    def __init__(self, channels=1):
+    def __init__(self, in_channels=2, hidden_channels=64): # 增加基础通道数到 64
         super(TimeSpaceAdapter, self).__init__()
-        # 输入包括：当前预测值 + 上个月的残差 + (可选) 原始特征
-        self.conv1 = nn.Conv2d(2, 32, kernel_size=3, padding=1)
-        self.res_block = nn.Sequential(
-            nn.Conv2d(32, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        
+        # 1. 初始特征投影：从 2 通道 (当前预测 + 上月残差) 映射到高维空间
+        self.input_conv = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True)
         )
-        self.conv_out = nn.Conv2d(32, 1, kernel_size=3, padding=1)
-        self.relu = nn.ReLU()
+        
+        # 2. 堆叠多个残差块 (Deep Layers)
+        # 增加深度到 3 个残差块（共 6 层卷积），显著提升非线性表达能力
+        self.res_layers = nn.Sequential(
+            ResidualBlock(hidden_channels),
+            ResidualBlock(hidden_channels),
+            ResidualBlock(hidden_channels)
+        )
+        
+        # 3. 输出头：映射回单通道的 Delta (修正值)
+        self.output_conv = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels // 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels // 2, 1, kernel_size=3, padding=1)
+        )
 
     def forward(self, current_pred, last_residual=None):
         if last_residual is None:
-            # 如果是序列第一个月，残差初始化为 0
             last_residual = torch.zeros_like(current_pred)
             
-        # 将当前预测和上月残差叠加作为输入
+        # 拼接当前预测和上月残差
         x = torch.cat([current_pred, last_residual], dim=1) 
         
         identity = current_pred
-        out = self.relu(self.conv1(x))
-        out = self.res_block(out)
-        delta = self.conv_out(out)
         
+        # 特征提取
+        feat = self.input_conv(x)
+        feat = self.res_layers(feat)
+        
+        # 计算残差修正值
+        delta = self.output_conv(feat)
+        
+        # 最终输出 = 原预测 + 学习到的增量
         return identity + delta
+
