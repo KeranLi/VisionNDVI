@@ -97,9 +97,6 @@ class ResFineTuningAdapter(nn.Module):
         x = x.reshape(batch_size, channels, height, width)
         
         return x
-    
-import torch
-import torch.nn as nn
 
 class ConvResAdapter(nn.Module):
     def __init__(self, in_channels=1, hidden_dim=32):
