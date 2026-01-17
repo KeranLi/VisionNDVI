@@ -77,3 +77,10 @@
 ### Added
 
 - Add TimeSpaceAdapter.
+
+## [1.0.0] - 2026-01-17
+
+### Added
+
+- Fixed some bugs.
+- Add multi-window TimeSpaceAdapter.

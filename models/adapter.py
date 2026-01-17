@@ -200,3 +200,42 @@ class TimeSpaceAdapter(nn.Module):
         # 最终输出 = 原预测 + 学习到的增量
         return identity + delta
 
+class DeepMultiTimeAdapter(nn.Module):
+    def __init__(self, history_window=3, hidden_channels=64):
+        super(DeepMultiTimeAdapter, self).__init__()
+        self.history_window = history_window
+        in_channels = 1 + history_window # 当前预测(1) + 历史残差(N)
+        
+        self.input_conv = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.res_layers = nn.Sequential(
+            *[ResidualBlock(hidden_channels) for _ in range(4)]
+        )
+        
+        self.output_conv = nn.Conv2d(hidden_channels, 1, kernel_size=3, padding=1)
+
+    def forward(self, current_pred, residual_history):
+        """
+        current_pred: [B, 1, H, W]
+        residual_history: [B, N, H, W]
+        """
+        # 如果没有历史记录（第一帧），自动补0
+        if residual_history is None:
+            residual_history = torch.zeros(
+                current_pred.size(0), self.history_window, 
+                current_pred.size(2), current_pred.size(3)
+            ).to(current_pred.device)
+            
+        # 沿着通道维度拼接: 1 + N
+        x = torch.cat([current_pred, residual_history], dim=1) 
+        
+        feat = self.input_conv(x)
+        feat = self.res_layers(feat)
+        delta = self.output_conv(feat)
+        
+        return current_pred + delta
+

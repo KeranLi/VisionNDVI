@@ -10,6 +10,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+from collections import deque
 
 # ==================== Configuration ====================
 TARGET_SHAPE = (2154, 4320)
@@ -677,6 +678,131 @@ def run_inference_with_time_adapter(
             prev_residual = (final_output - targets).detach()
 
             # --- 6. 保存与绘图 (逻辑同前) ---
+            final_output_np = final_output.cpu().numpy()
+            targets_masked_np = (targets * curr_mask).cpu().numpy()
+            
+            base_name = os.path.basename(file_path[0]).replace('.npy', '')
+            np.save(os.path.join(output_dir, f"{base_name}_pred.npy"), final_output_np[0])
+            
+            save_residual_map(final_output_np[0], targets_masked_np[0], output_dir, base_name)
+            save_residual_distribution(final_output_np[0], targets_masked_np[0], output_dir, base_name, mask_path)
+            
+            file_paths.append(file_path[0])
+            predictions.append(final_output_np[0])
+
+    return predictions, file_paths
+
+def run_inference_with_multi_history(
+    model, dataloader, device, output_dir, 
+    adapter=None, grid_size=30, num_iterations=50, 
+    mask_path='datasets/AWI-CM-1-1-MR/mask.npy',
+    window_size=3  # 此参数必须与 Adapter 的 history_window 一致
+):
+    os.makedirs(output_dir, exist_ok=True)
+    predictions, file_paths = [], []
+    optimizer = torch.optim.Adam(adapter.parameters(), lr=1e-3)
+
+    # 1. 加载全局掩码
+    global_mask_np = np.load(mask_path)
+    global_mask = torch.from_numpy(global_mask_np).float().to(device).unsqueeze(0).unsqueeze(0)
+    
+    # 2. 初始化滑动窗口队列 (长度固定为 N)
+    res_queue = deque([None] * window_size, maxlen=window_size)
+
+    # 3. 融合遮罩生成 (保持平滑过渡)
+    stride = grid_size // 2  
+    fusion_mask = torch.ones((1, 1, grid_size, grid_size)).to(device)
+    for i in range(grid_size):
+        dist = min(i, grid_size - 1 - i) / (grid_size // 2)
+        fusion_mask[:, :, i, :] *= dist
+        fusion_mask[:, :, :, i] *= dist
+    fusion_mask = torch.clamp(fusion_mask, min=0.1)
+
+    model.eval()
+    
+    for batch_idx, (features, targets, file_path) in enumerate(tqdm(dataloader, desc="N-Step History Refining")):
+        features, targets = features.to(device), targets.to(device)
+        if targets.dim() == 3: targets = targets.unsqueeze(1)
+        
+        with torch.no_grad():
+            base_output = model(features)
+            if base_output.dim() == 3: base_output = base_output.unsqueeze(1)
+            base_output = base_output.detach().float()
+
+        B, C, H, W = base_output.shape
+        curr_mask = global_mask[:, :, :H, :W]
+        
+        # --- 核心：准备 N 个月的历史残差张量 ---
+        history_list = []
+        for r in res_queue:
+            if r is None:
+                history_list.append(torch.zeros_like(base_output)) # 早期填充0
+            else:
+                history_list.append(r)
+        # 拼接形状: [B, window_size, H, W]
+        combined_history = torch.cat(history_list, dim=1) 
+
+        # --- 分块提取 ---
+        base_patches, gt_patches, mask_patches, hist_patches, coords = [], [], [], [], []
+        for y in range(0, H - grid_size + 1, stride):
+            for x in range(0, W - grid_size + 1, stride):
+                base_patches.append(base_output[:, :, y:y+grid_size, x:x+grid_size])
+                gt_patches.append(targets[:, :, y:y+grid_size, x:x+grid_size])
+                mask_patches.append(curr_mask[:, :, y:y+grid_size, x:x+grid_size])
+                hist_patches.append(combined_history[:, :, y:y+grid_size, x:x+grid_size])
+                coords.append((y, x))
+        
+        all_base = torch.cat(base_patches, dim=0) 
+        all_gt = torch.cat(gt_patches, dim=0)
+        all_mask = torch.cat(mask_patches, dim=0)
+        all_hist = torch.cat(hist_patches, dim=0)
+
+        # --- 迭代微调 ---
+        adapter.train()
+        inner_batch_size = 128
+        num_patches = all_base.size(0)
+
+        for iteration in range(num_iterations):
+            indices = torch.randperm(num_patches)
+            for start_idx in range(0, num_patches, inner_batch_size):
+                idx = indices[start_idx : start_idx + inner_batch_size]
+                
+                optimizer.zero_grad()
+                adjusted = adapter(all_base[idx], all_hist[idx])
+                
+                mask_bool = (all_mask[idx] > 0.5)
+                if mask_bool.any():
+                    loss_mse = F.mse_loss(adjusted[mask_bool], all_gt[idx][mask_bool])
+                    loss_l1 = F.l1_loss(adjusted[mask_bool], all_gt[idx][mask_bool])
+                    penalty = torch.mean(torch.relu(-adjusted[mask_bool])**2) + \
+                              torch.mean(torch.relu(adjusted[mask_bool] - 1.0)**2)
+                    
+                    (10.0 * loss_mse + 2.0 * loss_l1 + 10.0 * penalty).backward()
+                    optimizer.step()
+
+        # --- 推理与更新队列 ---
+        adapter.eval()
+        with torch.no_grad():
+            combined_output = torch.zeros_like(base_output)
+            weight_sum = torch.zeros_like(base_output)
+            
+            for i in range(0, num_patches, inner_batch_size):
+                end_i = min(i + inner_batch_size, num_patches)
+                refined_p = adapter(all_base[i:end_i], all_hist[i:end_i])
+                
+                for j in range(refined_p.size(0)):
+                    y, x = coords[i + j]
+                    combined_output[:, :, y:y+grid_size, x:x+grid_size] += refined_p[j:j+1] * fusion_mask
+                    weight_sum[:, :, y:y+grid_size, x:x+grid_size] += fusion_mask
+
+            final_output = torch.where(weight_sum > 0, combined_output / weight_sum, base_output)
+            final_output = torch.clamp(final_output * curr_mask, 0.0, 1.0)
+
+            # 更新历史队列：放入当前月的真实残差 (Refined - GroundTruth)
+            current_residual = (final_output - targets).detach()
+            res_queue.append(current_residual)
+
+            # ---保存与绘图 (逻辑同前) ---
             final_output_np = final_output.cpu().numpy()
             targets_masked_np = (targets * curr_mask).cpu().numpy()
             
