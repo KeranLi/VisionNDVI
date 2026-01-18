@@ -112,9 +112,12 @@ def main():
         dataloader, 
         device, 
         pred_dir, 
-        adapter=adapter,          # 明确指定
-        num_iterations=5,       # 明确指定
-        window_size=3            # 如果你用的是 3 个月历史
+        adapter=adapter,
+        grid_size=30,
+        mask_path='datasets/AWI-CM-1-1-MR/mask.npy',
+        window_size=3,
+        early_stop_threshold=1e-8, # Higher for more iterations.
+        patience=10
     )
 
     # Visualize and evaluate if requested

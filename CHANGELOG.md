@@ -84,3 +84,10 @@
 
 - Fixed some bugs.
 - Add multi-window TimeSpaceAdapter.
+
+## [1.0.0] - 2026-01-18
+
+### Added
+
+- Fixed some bugs.
+- Add dynamic training method.
