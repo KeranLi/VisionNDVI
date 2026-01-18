@@ -1,18 +1,11 @@
-#!/usr/bin/env python3
-"""
-tif2npy.py
-按指定年月范围把多波段 GeoTIFF 拆成单波段 .npy
-用法：python tif2npy.py
-"""
-
 import os, re, glob, numpy as np, rioxarray as rxr, pandas as pd
 from tqdm import tqdm
 
 # ================== 仅改这里 ==================
-INPUT_DIR   = "./dataset/Temperature/"
-OUTPUT_DIR  = "./dataset/Temperature/"
-START_YYYYMM = 198201   # 起始年月（含）
-END_YYYYMM   = 201412   # 结束年月（含）
+INPUT_DIR   = "E:/scenarioMIP_output/future_resampled_this/evspsbl/AWI-CM-1-1-MR/ssp245"
+OUTPUT_DIR  = "./npy/evspsbl/AWI-CM-1-1-MR/ssp245"
+START_YYYYMM = 201501   # 起始年月（含）
+END_YYYYMM   = 210012   # 结束年月（含）
 # ============================================
 
 def yyyymm_to_datetime(yyyymm_int):
@@ -24,32 +17,29 @@ START_DATE = yyyymm_to_datetime(START_YYYYMM)
 END_DATE   = yyyymm_to_datetime(END_YYYYMM)
 
 def sanitize_var(name):
-    return name.split('_')[0]
+    """ 从文件名中提取变量名，去掉无关的部分 """
+    return name.split('_')[1]  # 从 'evspsbl_AWI-CM-1-1-MR_ssp126_2015-01.tif' 提取 'AWI-CM-1-1-MR'
 
-def parse_times(da):
+def parse_times(da, src_path):
     """
     返回 list[(index, YYYYMM_int)]，只保留在 [START_DATE, END_DATE] 内的
     支持 'time' 坐标 或 'band' 维
+    解析文件名中的日期
     """
-    if 'time' in da.coords:
-        times = pd.to_datetime(da['time'].values)
-        idx_yyyymm = [(i, t.year*100 + t.month) for i, t in enumerate(times)
-                      if START_DATE <= t <= END_DATE]
-    elif 'band' in da.dims and da.sizes['band'] > 1:
-        # 没有时间坐标，按 band1..bandN 依次映射到连续月份
-        # 假设 band1=START_DATE, band2=START_DATE+1month ...
-        total_bands = da.sizes['band']
-        base = pd.date_range(START_DATE, periods=total_bands, freq='MS')
-        idx_yyyymm = [(i, d.year*100 + d.month) for i, d in enumerate(base)
-                      if d <= END_DATE]
-    else:
-        # 单波段
-        idx_yyyymm = [(0, START_YYYYMM)] if START_DATE == END_DATE else []
+    # 从文件路径中提取日期（例如 '2015-01' -> 201501）
+    match = re.search(r"(\d{4})-(\d{2})\.tif", os.path.basename(src_path))
+    if not match:
+        raise ValueError(f"无法从文件名提取日期: {src_path}")
+    
+    year, month = map(int, match.groups())
+    file_yyyymm = year * 100 + month
+    idx_yyyymm = [(0, file_yyyymm)] if START_DATE <= pd.Timestamp(year, month, 1) <= END_DATE else []
+    
     return idx_yyyymm
 
 def process_one_tif(src_path):
     da = rxr.open_rasterio(src_path, masked=True)
-    idx_yyyymm = parse_times(da)
+    idx_yyyymm = parse_times(da, src_path)  # 传递文件路径
     if not idx_yyyymm:
         return 0
 
@@ -78,7 +68,7 @@ def main():
     total_written = 0
     for fp in tqdm(tif_files, desc="Scanning"):
         da = rxr.open_rasterio(fp, masked=True)
-        idx_yyyymm = parse_times(da)
+        idx_yyyymm = parse_times(da, fp)  # 传递文件路径
         expected = (END_YYYYMM // 100 - START_YYYYMM // 100) * 12 \
                  + (END_YYYYMM % 100 - START_YYYYMM % 100) + 1
         actual   = len(idx_yyyymm)

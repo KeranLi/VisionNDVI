@@ -91,3 +91,9 @@
 
 - Fixed some bugs.
 - Add dynamic training method.
+- Modify new versions for converting tif file to npy file.
+
+### Known Issues
+
+- tif2npy_version_1.py aim to process tif data named by like 200111 (YYYYMM).
+- tif2npy_version_2.py aim to process tif data named by like 2001-11 (YYYY-MM).

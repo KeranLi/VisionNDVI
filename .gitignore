@@ -3,3 +3,4 @@
 datasets/
 checkpoints/
 inference_results/
+npy/
