@@ -117,7 +117,9 @@ def main():
         mask_path='datasets/AWI-CM-1-1-MR/mask.npy',
         window_size=3,
         early_stop_threshold=1e-8, # Higher for more iterations.
-        patience=10
+        patience=10,
+        save_adapter=True,          # 启用保存
+        checkpoint_freq=12          # 每12个月保存一次中间状态（可选）
     )
 
     # Visualize and evaluate if requested

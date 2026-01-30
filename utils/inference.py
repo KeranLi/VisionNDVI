@@ -695,20 +695,22 @@ def run_inference_with_time_adapter(
 def run_inference_with_multi_history(
     model, dataloader, device, output_dir,
     adapter=None, grid_size=30, mask_path='datasets/AWI-CM-1-1-MR/mask.npy',
-    window_size=3, early_stop_threshold=1e-6, patience=10  # 设置early stop阈值和耐心值
+    window_size=3, early_stop_threshold=1e-6, patience=10,  # Set the early stop threshold and patience value
+    save_adapter=True,  # New addition: Whether to save the weights
+    checkpoint_freq=None  # New addition: How often to save the intermediate results for each batch? None indicates that only the final results will be saved.
 ):
     os.makedirs(output_dir, exist_ok=True)
     predictions, file_paths = [], []
     optimizer = torch.optim.Adam(adapter.parameters(), lr=1e-3)
 
-    # 1. 加载全局掩码
+    # Load global mask
     global_mask_np = np.load(mask_path)
     global_mask = torch.from_numpy(global_mask_np).float().to(device).unsqueeze(0).unsqueeze(0)
 
-    # 2. 初始化滑动窗口队列 (长度固定为 N)
+    # Initialize the sliding window queue (with a fixed length of N)
     res_queue = deque([None] * window_size, maxlen=window_size)
 
-    # 3. 融合遮罩生成 (保持平滑过渡)
+    # Blending Mask Generation (Maintaining Smooth Transition)
     stride = grid_size // 2
     fusion_mask = torch.ones((1, 1, grid_size, grid_size)).to(device)
     for i in range(grid_size):
@@ -719,10 +721,10 @@ def run_inference_with_multi_history(
 
     model.eval()
 
-    # 监控损失变化的变量
-    prev_loss = float('inf')  # 上一轮的损失
-    patience_counter = 0  # 记录连续多少次损失没有下降
-    best_loss = prev_loss  # 最好的损失
+    # Variables for monitoring changes in losses
+    prev_loss = float('inf')  # The previous round's losses
+    patience_counter = 0  # Record the number of consecutive times that the loss has not decreased
+    best_loss = prev_loss  # The best loss
     iteration = 0
 
     for batch_idx, (features, targets, file_path) in enumerate(tqdm(dataloader, desc="N-Step History Refining")):
@@ -739,17 +741,17 @@ def run_inference_with_multi_history(
         B, C, H, W = base_output.shape
         curr_mask = global_mask[:, :, :H, :W]
 
-        # --- 核心：准备 N 个月的历史残差张量 ---
+        # Prepare an N-month historical residual tensor
         history_list = []
         for r in res_queue:
             if r is None:
-                history_list.append(torch.zeros_like(base_output))  # 早期填充0
+                history_list.append(torch.zeros_like(base_output))  # Zero filling
             else:
                 history_list.append(r)
-        # 拼接形状: [B, window_size, H, W]
+        # Joined shape: [B, window_size, H, W]
         combined_history = torch.cat(history_list, dim=1)
 
-        # --- 分块提取 ---
+        #  Chunk extraction
         base_patches, gt_patches, mask_patches, hist_patches, coords = [], [], [], [], []
         for y in range(0, H - grid_size + 1, stride):
             for x in range(0, W - grid_size + 1, stride):
@@ -764,12 +766,12 @@ def run_inference_with_multi_history(
         all_mask = torch.cat(mask_patches, dim=0)
         all_hist = torch.cat(hist_patches, dim=0)
 
-        # --- 迭代微调 ---
+        # Iterative fine-tuning / Online assimilation (with early stopping)
         adapter.train()
         inner_batch_size = 512
         num_patches = all_base.size(0)
 
-        for _ in range(100):  # 最大迭代次数（可以根据需要调整）
+        for _ in range(100):  # Maximum number of iterations
             indices = torch.randperm(num_patches)
             for start_idx in range(0, num_patches, inner_batch_size):
                 idx = indices[start_idx : start_idx + inner_batch_size]
@@ -788,11 +790,11 @@ def run_inference_with_multi_history(
                     loss.backward()
                     optimizer.step()
 
-                    # 判断损失变化是否达到阈值
+                    # Determine whether the change in losses has reached the threshold
                     if abs(prev_loss - loss.item()) < early_stop_threshold:
-                        patience_counter += 1  # 连续几次没有显著变化
+                        patience_counter += 1  # There have been no significant changes for several consecutive times
                     else:
-                        patience_counter = 0  # 如果损失有显著变化，则重置计数器
+                        patience_counter = 0  # If the loss shows significant changes, then reset the counter
 
                     prev_loss = loss.item()
 
@@ -805,7 +807,7 @@ def run_inference_with_multi_history(
             if patience_counter >= patience:
                 break
 
-        # --- 推理与更新队列 ---
+        # Reasoning and update the sequence
         adapter.eval()
         with torch.no_grad():
             combined_output = torch.zeros_like(base_output)
@@ -823,11 +825,11 @@ def run_inference_with_multi_history(
             final_output = torch.where(weight_sum > 0, combined_output / weight_sum, base_output)
             final_output = torch.clamp(final_output * curr_mask, 0.0, 1.0)
 
-            # 更新历史队列：放入当前月的真实残差 (Refined - GroundTruth)
+            # Update historical queue: Add the actual residuals for the current month (Refined - GroundTruth)
             current_residual = (final_output - targets).detach()
             res_queue.append(current_residual)
 
-            # --- 保存与绘图 ---
+            # Save and plotting
             final_output_np = final_output.cpu().numpy()
             targets_masked_np = (targets * curr_mask).cpu().numpy()
 
@@ -839,6 +841,33 @@ def run_inference_with_multi_history(
 
             file_paths.append(file_path[0])
             predictions.append(final_output_np[0])
+
+            # New: Regularly save intermediate weights
+            if save_adapter and checkpoint_freq is not None and (batch_idx + 1) % checkpoint_freq == 0:
+                ckpt_path = os.path.join(output_dir, f"adapter_checkpoint_batch{batch_idx}.pt")
+                torch.save({
+                    'batch_idx': batch_idx,
+                    'model_state_dict': adapter.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'res_queue': list(res_queue),  # Save the sequence status
+                    'loss': prev_loss,
+                }, ckpt_path)
+                print(f"Saved intermediate checkpoint to {ckpt_path}")
+
+            # New: save the final weights
+            if save_adapter:
+                final_path = os.path.join(output_dir, "final_adapter.pt")
+                torch.save({
+                    'model_state_dict': adapter.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),  # If need to continue training
+                    'window_size': window_size,
+                    'final_res_queue': list(res_queue),  # Final historical state
+                    'num_batches': len(predictions),
+                }, final_path)
+                print(f"\n✓ Final adapter weights saved to: {final_path}")
+                
+                # Save the pure Adapter's model weights (for ease of deployment)
+                torch.save(adapter.state_dict(), os.path.join(output_dir, "final_adapter_weights_only.pt"))
 
     return predictions, file_paths
 
