@@ -2,8 +2,8 @@ import os, re, glob, numpy as np, rioxarray as rxr, pandas as pd
 from tqdm import tqdm
 
 # ================== 仅改这里 ==================
-INPUT_DIR   = "E:/scenarioMIP_output/future_resampled_this/evspsbl/AWI-CM-1-1-MR/ssp245"
-OUTPUT_DIR  = "./npy/evspsbl/AWI-CM-1-1-MR/ssp245"
+INPUT_DIR   = "E:/scenarioMIP_output/future_resampled_this/tas/AWI-CM-1-1-MR/ssp585"
+OUTPUT_DIR  = "./npy/tas/AWI-CM-1-1-MR/ssp585"
 START_YYYYMM = 201501   # 起始年月（含）
 END_YYYYMM   = 210012   # 结束年月（含）
 # ============================================
@@ -72,7 +72,7 @@ def main():
         expected = (END_YYYYMM // 100 - START_YYYYMM // 100) * 12 \
                  + (END_YYYYMM % 100 - START_YYYYMM % 100) + 1
         actual   = len(idx_yyyymm)
-        print(f"{os.path.basename(fp):<40} 期望 {expected} 月  实际 {actual} 月")
+        #print(f"{os.path.basename(fp):<40} 期望 {expected} 月  实际 {actual} 月")
         total_written += process_one_tif(fp)
 
     print(f"✅ 全部完成！共写出 {total_written} 个 .npy")

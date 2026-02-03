@@ -97,3 +97,41 @@
 
 - tif2npy_version_1.py aim to process tif data named by like 200111 (YYYYMM).
 - tif2npy_version_2.py aim to process tif data named by like 2001-11 (YYYY-MM).
+
+## [1.0.0] - 2026-01-24
+
+### Added
+
+- Add .bat manuscript pairs (tif2npy_batch.bat / tif2npy_batch.py) to automatically convert .tif files to .npy files.
+- Add tif2npy_version_3_batch.py manuscript to automatically convert .tif files to .npy files.
+
+### Known Issues
+
+- On Window platform, the **Path** and **Environment** often take errors. We do not recommend using **.bat**.
+- We recommend using **tif2npy_version_3_batch.py**.
+
+## [1.0.0] - 2026-02-03
+
+### Added
+
+- Add `run_inference_with_multi_history_v2()` function in `utils/inference.py`.
+  - Support custom finetune time period (e.g., `finetune_start_date="198001"`, `finetune_end_date="200101"`).
+  - Auto-detect NDVI label availability: finetune + evaluate if label exists, direct prediction if not.
+  - Only keep the last finetuned weights after all batches processed.
+
+### Usage Example
+
+```python
+from utils.inference import run_inference_with_multi_history_v2
+
+predictions, file_paths = run_inference_with_multi_history_v2(
+    model=model,
+    dataloader=test_loader,
+    device=device,
+    output_dir="results/finetune_1980_2001",
+    adapter=adapter,
+    finetune_start_date="198001",
+    finetune_end_date="200101",
+    save_adapter=True
+)
+```
