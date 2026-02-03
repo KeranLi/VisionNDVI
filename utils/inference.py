@@ -871,3 +871,284 @@ def run_inference_with_multi_history(
 
     return predictions, file_paths
 
+
+def run_inference_with_multi_history_v2(
+    model,
+    dataloader,
+    device,
+    output_dir,
+    adapter=None,
+    grid_size=30,
+    mask_path='datasets/AWI-CM-1-1-MR/mask.npy',
+    window_size=3,
+    early_stop_threshold=1e-6,
+    patience=10,
+    save_adapter=True,
+    # 新增参数：时间段过滤
+    finetune_start_date=None,  # 例如 "198001"
+    finetune_end_date=None,    # 例如 "200101"
+    date_format="%Y%m"
+):
+    """
+    增强版多历史残差推理函数
+    
+    新特性：
+    1. 支持设置时间段进行微调 (finetune_start_date, finetune_end_date)
+    2. 自动检测是否有NDVI label数据，有则微调+评估，无则直接预测
+    3. 仅保留最后一次微调后的权重
+    
+    参数:
+        model: 基础模型
+        dataloader: 数据加载器
+        device: 计算设备
+        output_dir: 输出目录
+        adapter: 适配器模型
+        grid_size: 网格大小
+        mask_path: 掩码文件路径
+        window_size: 历史窗口大小
+        early_stop_threshold: 早停阈值
+        patience: 早停耐心值
+        save_adapter: 是否保存适配器权重
+        finetune_start_date: 微调开始时间 (如 "198001")
+        finetune_end_date: 微调结束时间 (如 "200101")
+        date_format: 日期格式
+    
+    返回:
+        predictions: 预测结果列表
+        file_paths: 文件路径列表
+    """
+    from datetime import datetime
+    
+    os.makedirs(output_dir, exist_ok=True)
+    predictions, file_paths = [], []
+    
+    # 如果有adapter才创建优化器
+    optimizer = None
+    if adapter is not None:
+        optimizer = torch.optim.Adam(adapter.parameters(), lr=1e-3)
+    
+    # 解析日期范围
+    start_dt = None
+    end_dt = None
+    if finetune_start_date is not None:
+        start_dt = datetime.strptime(finetune_start_date, date_format)
+    if finetune_end_date is not None:
+        end_dt = datetime.strptime(finetune_end_date, date_format)
+    
+    # Load global mask
+    global_mask_np = np.load(mask_path)
+    global_mask = torch.from_numpy(global_mask_np).float().to(device).unsqueeze(0).unsqueeze(0)
+
+    # Initialize the sliding window queue (with a fixed length of N)
+    res_queue = deque([None] * window_size, maxlen=window_size)
+
+    # Blending Mask Generation
+    stride = grid_size // 2
+    fusion_mask = torch.ones((1, 1, grid_size, grid_size)).to(device)
+    for i in range(grid_size):
+        dist = min(i, grid_size - 1 - i) / (grid_size // 2)
+        fusion_mask[:, :, i, :] *= dist
+        fusion_mask[:, :, :, i] *= dist
+    fusion_mask = torch.clamp(fusion_mask, min=0.1)
+
+    model.eval()
+    if adapter is not None:
+        adapter.eval()
+
+    # Variables for monitoring changes in losses
+    prev_loss = float('inf')
+    patience_counter = 0
+    iteration = 0
+    
+    # 记录是否在微调时间段内有训练
+    has_finetuned = False
+    last_finetuned_batch = -1
+
+    for batch_idx, batch_data in enumerate(tqdm(dataloader, desc="Multi-History Refining")):
+        # 处理不同长度的batch_data (可能有或没有targets)
+        if len(batch_data) == 3:
+            features, targets, file_path = batch_data
+        else:
+            features, file_path = batch_data
+            targets = None
+        
+        # 从文件名提取日期
+        date_str = os.path.basename(file_path[0]).split('.')[0][-6:]
+        try:
+            file_dt = datetime.strptime(date_str, date_format)
+        except ValueError:
+            file_dt = None
+        
+        # 判断是否需要在当前batch进行微调
+        should_finetune = False
+        if targets is not None and adapter is not None:
+            # 检查是否在指定的时间段内
+            if start_dt is not None and end_dt is not None:
+                should_finetune = start_dt <= file_dt <= end_dt
+            elif start_dt is not None:
+                should_finetune = file_dt >= start_dt
+            elif end_dt is not None:
+                should_finetune = file_dt <= end_dt
+            else:
+                should_finetune = True  # 没有指定时间段则全部微调
+        
+        features = features.to(device)
+        if targets is not None:
+            targets = targets.to(device)
+            if targets.dim() == 3:
+                targets = targets.unsqueeze(1)
+
+        with torch.no_grad():
+            base_output = model(features)
+            if base_output.dim() == 3:
+                base_output = base_output.unsqueeze(1)
+            base_output = base_output.detach().float()
+
+        B, C, H, W = base_output.shape
+        curr_mask = global_mask[:, :, :H, :W]
+
+        # Prepare historical residual tensor
+        history_list = []
+        for r in res_queue:
+            if r is None:
+                history_list.append(torch.zeros_like(base_output))
+            else:
+                history_list.append(r)
+        combined_history = torch.cat(history_list, dim=1)
+
+        # Chunk extraction
+        base_patches, gt_patches, mask_patches, hist_patches, coords = [], [], [], [], []
+        for y in range(0, H - grid_size + 1, stride):
+            for x in range(0, W - grid_size + 1, stride):
+                base_patches.append(base_output[:, :, y:y+grid_size, x:x+grid_size])
+                if targets is not None:
+                    gt_patches.append(targets[:, :, y:y+grid_size, x:x+grid_size])
+                mask_patches.append(curr_mask[:, :, y:y+grid_size, x:x+grid_size])
+                hist_patches.append(combined_history[:, :, y:y+grid_size, x:x+grid_size])
+                coords.append((y, x))
+
+        all_base = torch.cat(base_patches, dim=0)
+        all_mask = torch.cat(mask_patches, dim=0)
+        all_hist = torch.cat(hist_patches, dim=0)
+        
+        if targets is not None:
+            all_gt = torch.cat(gt_patches, dim=0)
+
+        # 判断是否进行微调
+        if should_finetune and targets is not None and adapter is not None:
+            has_finetuned = True
+            last_finetuned_batch = batch_idx
+            
+            adapter.train()
+            inner_batch_size = 512
+            num_patches = all_base.size(0)
+            
+            prev_loss = float('inf')
+            patience_counter = 0
+
+            for _ in range(100):  # 最大迭代次数
+                indices = torch.randperm(num_patches)
+                for start_idx in range(0, num_patches, inner_batch_size):
+                    idx = indices[start_idx : start_idx + inner_batch_size]
+
+                    optimizer.zero_grad()
+                    adjusted = adapter(all_base[idx], all_hist[idx])
+
+                    mask_bool = (all_mask[idx] > 0.5)
+                    if mask_bool.any():
+                        loss_mse = F.mse_loss(adjusted[mask_bool], all_gt[idx][mask_bool])
+                        loss_l1 = F.l1_loss(adjusted[mask_bool], all_gt[idx][mask_bool])
+                        penalty = torch.mean(torch.relu(-adjusted[mask_bool])**2) + \
+                                  torch.mean(torch.relu(adjusted[mask_bool] - 1.0)**2)
+
+                        loss = 10.0 * loss_mse + 2.0 * loss_l1 + 10.0 * penalty
+                        loss.backward()
+                        optimizer.step()
+
+                        if abs(prev_loss - loss.item()) < early_stop_threshold:
+                            patience_counter += 1
+                        else:
+                            patience_counter = 0
+
+                        prev_loss = loss.item()
+
+                        if patience_counter >= patience:
+                            print(f"Early stopping at batch {batch_idx}, iteration {iteration}")
+                            break
+
+                iteration += 1
+                if patience_counter >= patience:
+                    break
+
+        # 推理
+        if adapter is not None:
+            adapter.eval()
+            
+        with torch.no_grad():
+            combined_output = torch.zeros_like(base_output)
+            weight_sum = torch.zeros_like(base_output)
+
+            inner_batch_size = 512
+            num_patches = all_base.size(0)
+            
+            for i in range(0, num_patches, inner_batch_size):
+                end_i = min(i + inner_batch_size, num_patches)
+                
+                if adapter is not None:
+                    refined_p = adapter(all_base[i:end_i], all_hist[i:end_i])
+                else:
+                    refined_p = all_base[i:end_i]
+
+                for j in range(refined_p.size(0)):
+                    y, x = coords[i + j]
+                    combined_output[:, :, y:y+grid_size, x:x+grid_size] += refined_p[j:j+1] * fusion_mask
+                    weight_sum[:, :, y:y+grid_size, x:x+grid_size] += fusion_mask
+
+            final_output = torch.where(weight_sum > 0, combined_output / weight_sum, base_output)
+            final_output = torch.clamp(final_output * curr_mask, 0.0, 1.0)
+
+            # 更新历史队列 (如果有targets则使用真实残差，否则使用0)
+            if targets is not None:
+                current_residual = (final_output - targets).detach()
+            else:
+                current_residual = torch.zeros_like(final_output)
+            res_queue.append(current_residual)
+
+            # 保存预测结果
+            final_output_np = final_output.cpu().numpy()
+            base_name = os.path.basename(file_path[0]).replace('.npy', '')
+            np.save(os.path.join(output_dir, f"{base_name}_pred.npy"), final_output_np[0])
+
+            # 如果有targets则进行评估和可视化
+            if targets is not None:
+                targets_masked_np = (targets * curr_mask).cpu().numpy()
+                save_residual_map(final_output_np[0], targets_masked_np[0], output_dir, base_name)
+                save_residual_distribution(final_output_np[0], targets_masked_np[0], output_dir, base_name, mask_path)
+
+            file_paths.append(file_path[0])
+            predictions.append(final_output_np[0])
+
+    # 所有batch处理完成后，仅保留最后一次微调后的权重
+    if save_adapter and has_finetuned and adapter is not None:
+        # 保存完整检查点
+        final_path = os.path.join(output_dir, "final_adapter.pt")
+        torch.save({
+            'model_state_dict': adapter.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'window_size': window_size,
+            'final_res_queue': list(res_queue),
+            'num_batches': len(predictions),
+            'finetuned_batches': last_finetuned_batch + 1,
+            'finetune_start_date': finetune_start_date,
+            'finetune_end_date': finetune_end_date,
+        }, final_path)
+        print(f"\n✓ Final adapter weights saved to: {final_path}")
+        
+        # 仅保存模型权重
+        torch.save(adapter.state_dict(), os.path.join(output_dir, "final_adapter_weights_only.pt"))
+        print(f"✓ Adapter weights only saved to: {os.path.join(output_dir, 'final_adapter_weights_only.pt')}")
+    else:
+        print("\nℹ No finetuning performed or adapter is None, no weights saved.")
+
+    return predictions, file_paths
+
