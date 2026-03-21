@@ -79,14 +79,20 @@ class UNetEnhancedCNNModel(nn.Module):
 def load_model(checkpoint_path, device, use_dataparallel=False):
     """Load model from checkpoint with DataParallel handling"""
     model = UNetEnhancedCNNModel()
-    state_dict = torch.load(checkpoint_path, map_location=device)
+    
+    # 先加载到 CPU，避免 GPU OOM
+    state_dict = torch.load(checkpoint_path, map_location='cpu')
     
     # Handle DataParallel state dict
-    if 'module.' in list(state_dict.keys())[0]:
+    if len(state_dict.keys()) > 0 and 'module.' in list(state_dict.keys())[0]:
         model = nn.DataParallel(model)
     
     model.load_state_dict(state_dict)
-    model.to(device)
+    
+    # 再移动到目标设备
+    if device != 'cpu':
+        model = model.to(device)
+    
     model.eval()
     
     print(f"Model loaded from {checkpoint_path}")

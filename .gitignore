@@ -4,3 +4,4 @@ datasets/
 checkpoints/
 inference_results/
 npy/
+__pycache__/

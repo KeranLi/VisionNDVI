@@ -6,6 +6,11 @@ import torch.nn.functional as F
 import random
 import json
 from datetime import datetime
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+from collections import deque
 
 # ==================== Configuration ====================
 TARGET_SHAPE = (2154, 4320)
@@ -72,7 +77,9 @@ def load_stats(stats_path):
     """Load normalization statistics from JSON file"""
     if os.path.exists(stats_path):
         with open(stats_path, 'r') as f:
-            return json.load(f)
+            stats = json.load(f)
+            print("Loaded stats:", stats)  # Debug print the loaded stats
+            return stats
     else:
         raise FileNotFoundError(f"Statistics file not found: {stats_path}")
 
@@ -91,7 +98,10 @@ def denormalize(tensor, cat, stats):
     """Denormalize predictions to original scale"""
     d_min = stats[cat]['min']
     d_max = stats[cat]['max']
-    return tensor * (d_max - d_min) + d_min
+    #print(f"Denormalizing for {cat}: Min = {d_min}, Max = {d_max}")
+    denorm_tensor = tensor * (d_max - d_min) + d_min
+    #print(f"Denormalized tensor min: {np.min(denorm_tensor)}, max: {np.max(denorm_tensor)}")
+    return denorm_tensor
 
 def read_npy(file_path, category, stats_dict=None, normalize=True):
     """
@@ -184,3 +194,680 @@ def calculate_metrics(pred, actual, mask=None):
         'rmse': rmse,
         'r2': r2
     }
+
+def run_inference(model, dataloader, device, output_dir, denormalize_output=True, stats=None, adapter=None):
+    """Run inference and save predictions with optional adapter"""
+    os.makedirs(output_dir, exist_ok=True)
+    predictions = []
+    file_paths = []
+    
+    with torch.no_grad():
+        for batch_idx, (features, _, file_path) in enumerate(tqdm(dataloader, desc="Inference")):
+            features = features.to(device)
+            
+            # Forward pass through the model
+            with torch.cuda.amp.autocast():
+                outputs = model(features)
+            
+            # If adapter is provided, pass the output through the adapter
+            if adapter:
+                outputs = adapter(outputs)
+            
+            # Process each sample
+            for i in range(outputs.shape[0]):
+                pred = outputs[i].cpu().numpy()
+                
+                # Denormalize if requested
+                if denormalize_output and stats and 'NDVI_Monthly' in stats:
+                    pred = denormalize(torch.from_numpy(pred), 'NDVI_Monthly', stats).numpy()
+                
+                predictions.append(pred)
+                
+                # Save prediction
+                base_name = os.path.basename(file_path[i]).replace('.npy', '_pred.npy')
+                save_path = os.path.join(output_dir, base_name)
+                np.save(save_path, pred)
+                file_paths.append(file_path[i])
+    
+    print(f"Saved {len(predictions)} predictions to {output_dir}")
+    return predictions, file_paths
+
+def visualize_and_evaluate(predictions, file_paths, dataset, output_dir, stats, num_viz=10):
+    viz_dir = os.path.join(output_dir, 'visualizations')
+    os.makedirs(viz_dir, exist_ok=True)
+    
+    metrics = []
+    
+    for i in tqdm(range(min(num_viz, len(predictions))), desc="Visualization"):
+        # 1. 获取真实标签
+        _, actual, fp = dataset[i]
+        actual_np = actual.numpy().squeeze() # 确保是 (H, W)
+        
+        # 2. 获取预测值 (处理可能存在的 Batch 维度)
+        pred_np = predictions[i]
+        if isinstance(pred_np, np.ndarray):
+            # 如果 pred_np 是 (Batch, C, H, W)，取第一个样本并去掉多余维度
+            if pred_np.ndim == 4:
+                pred_np = pred_np[0].squeeze()
+            elif pred_np.ndim == 3:
+                pred_np = pred_np.squeeze()
+        
+        # --- 检查点：确保形状完全一致 ---
+        if pred_np.shape != actual_np.shape:
+            # 如果形状不匹配，强制调整或报错
+            from skimage.transform import resize
+            pred_np = resize(pred_np, actual_np.shape, preserve_range=True)
+
+        # 3. 计算指标 (只针对有效值)
+        mask = np.isfinite(actual_np) & (actual_np != -100.0)
+        metric = calculate_metrics(pred_np.flatten(), actual_np.flatten(), mask.flatten())
+        metric['file'] = os.path.basename(fp)
+        metrics.append(metric)
+
+        # 4. 绘图
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+        
+        # 设置统一的色阶范围，方便对比
+        vmin, vmax = -0.1, 0.9 # NDVI 的典型范围
+        
+        im0 = axes[0].imshow(pred_np, cmap='RdYlGn', vmin=vmin, vmax=vmax)
+        axes[0].set_title(f'Refined Prediction\n(ROI Modified)')
+        plt.colorbar(im0, ax=axes[0], fraction=0.025, pad=0.04)
+        
+        im1 = axes[1].imshow(actual_np, cmap='RdYlGn', vmin=vmin, vmax=vmax)
+        axes[1].set_title('Ground Truth')
+        plt.colorbar(im1, ax=axes[1], fraction=0.025, pad=0.04)
+
+        for ax in axes: ax.axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(viz_dir, f'eval_{os.path.basename(fp)}.png'))
+        plt.close()
+    
+    # Save metrics CSV
+    df = pd.DataFrame(metrics)
+    df.to_csv(os.path.join(output_dir, 'inference_metricsgit.csv'), index=False)
+    print(f"Metrics saved. Mean RMSE: {df['rmse'].mean():.4f}, Mean R²: {df['r2'].mean():.4f}")
+
+def split_image_into_blocks(batch_image, block_size=256):
+    """
+    Split a batch of images into smaller blocks.
+    Args:
+        batch_image (torch.Tensor): The input batch of images tensor of shape (batch_size, C, H, W).
+        block_size (int): The size of each block (e.g., 256 for 256x256 blocks).
+    Returns:
+        List of blocks (each block is a tensor of shape (batch_size, C, block_size, block_size)).
+    """
+    batch_size, C, H, W = batch_image.shape  # Ensure the input is a batch of images
+    blocks = []
+
+    # Iterate through the batch
+    for i in range(batch_size):
+        image = batch_image[i]
+        # Split each image into blocks
+        for h in range(0, H, block_size):
+            for w in range(0, W, block_size):
+                block = image[:, h:h+block_size, w:w+block_size]
+                blocks.append(block)
+
+    return blocks
+
+def save_residual_map(
+        prediction,
+        ground_truth,
+        output_dir,
+        base_name
+    ):
+    """
+    计算残差并保存。残差 = 预测 - 真值
+    """
+    # 确保是 2D 形状 [H, W]
+    pred = prediction.squeeze()
+    gt = ground_truth.squeeze()
+    residual = pred - gt
+    
+    # 1. 保存数值，用于后续定量分析 RMSE, R2
+    res_path = os.path.join(output_dir, f"{base_name}_residual.npy")
+    np.save(res_path, residual)
+    
+    # 2. 自动化可视化：这对研究空间模式非常有帮助
+    plt.figure(figsize=(8, 6))
+    # 使用 coolwarm 色调，0值对应白色，正值为红，负值为蓝
+    # vmin/vmax 设置为 0.1 左右，因为 NDVI 细微偏差更有意义
+    im = plt.imshow(residual, cmap='coolwarm', vmin=-0.1, vmax=0.1)
+    ax = plt.gca()
+    plt.colorbar(im, ax=ax, fraction=0.025, pad=0.04)
+    #plt.colorbar(im, label='Residual (Pred - GT)')
+    plt.title(f"Residual Map: {base_name}")
+    plt.axis('off')
+    
+    viz_path = os.path.join(output_dir, f"{base_name}_residual_viz.png")
+    plt.savefig(viz_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+def save_residual_distribution(
+        prediction,
+        ground_truth,
+        output_dir,
+        base_name,
+        mask_path='datasets/AWI-CM-1-1-MR/mask.npy'
+        ): # 新增 current_mask 参数
+
+        """
+        专门针对陆地像素统计残差分布，标注 μ 和 σ
+        """
+        # 1. 计算原始残差
+        residual_full = (prediction - ground_truth).flatten()
+        
+        # 2. 加载海洋掩码 (假设 1 为陆地, 0 为海洋)
+        # 如果 mask 很大，建议在外部加载好传进来，这里为了演示逻辑闭环写在内部
+        land_mask = np.load(mask_path).flatten()
+        
+        # 3. 核心步骤：只筛选出陆地部分的残差
+        # 确保 mask 长度与展平后的图像一致
+        land_residuals = residual_full[land_mask == 1]
+        
+        if len(land_residuals) == 0:
+            print(f"Warning: No land pixels found for {base_name}")
+            return
+
+        # 4. 计算陆地统计量
+        mu = np.mean(land_residuals)
+        sigma = np.std(land_residuals)
+        
+        # 5. 绘图
+        plt.figure(figsize=(10, 6))
+        
+        # 绘制直方图 (只包含陆地)
+        sns.histplot(land_residuals, bins=100, kde=True, color='teal', edgecolor='white', alpha=0.7)
+        
+        # 绘制 0 基准线
+        plt.axvline(x=0, color='red', linestyle='--', linewidth=1.5, label='Zero Error')
+        
+        # 在图中标注统计量
+        stats_text = f'$\mu_{{land}} = {mu:.6f}$\n$\sigma_{{land}} = {sigma:.6f}$'
+        plt.gca().text(0.95, 0.90, stats_text, transform=plt.gca().transAxes,
+                    fontsize=12, verticalalignment='top', horizontalalignment='right',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
+
+        plt.title(f'Land-Only Residual Distribution: {base_name}')
+        plt.xlabel('Residual (Pred - GT)')
+        plt.ylabel('Pixel Count')
+        
+        # 设置合理的 X 轴范围，过滤掉 0 值的海洋干扰后，
+        # 陆地分布的“宽度”会展现得非常清晰
+        plt.xlim(-0.2, 0.2) 
+        plt.grid(axis='y', alpha=0.3)
+        
+        dist_path = os.path.join(output_dir, f"{base_name}_residual_dist.png")
+        plt.savefig(dist_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+def run_inference_with_adapter(
+        model,
+        dataloader,
+        device,
+        output_dir,
+        denormalize_output=True,
+        stats=None, adapter=None,
+        grid_size=30,
+        num_iterations=100,
+        mask_path='datasets/AWI-CM-1-1-MR/mask.npy'
+        ):
+    
+    os.makedirs(output_dir, exist_ok=True)
+    predictions, file_paths = [], []
+    optimizer = torch.optim.Adam(adapter.parameters(), lr=2e-3)
+
+    # --- 加载全局掩码 ---
+    # 确保掩码在 GPU 上，形状为 [1, 1, H, W]
+    global_mask_np = np.load(mask_path)
+    global_mask = torch.from_numpy(global_mask_np).float().to(device).unsqueeze(0).unsqueeze(0)
+
+    stride = grid_size // 2  
+    fusion_mask = torch.ones((1, 1, grid_size, grid_size)).to(device)
+    for i in range(grid_size):
+        dist = min(i, grid_size - 1 - i) / (grid_size // 2)
+        fusion_mask[:, :, i, :] *= dist
+        fusion_mask[:, :, :, i] *= dist
+    fusion_mask = torch.clamp(fusion_mask, min=0.1) 
+
+    model.eval()
+    
+    for batch_idx, (features, targets, file_path) in enumerate(tqdm(dataloader, desc="Refining")):
+        features = features.to(device)
+        targets = targets.to(device).unsqueeze(1) if targets.dim() == 3 else targets.to(device)
+        
+        with torch.no_grad():
+            base_output = model(features)
+            if base_output.dim() == 3: base_output = base_output.unsqueeze(1)
+            base_output = base_output.detach().float()
+
+        B, C, H, W = base_output.shape
+        # 裁剪 mask 以匹配当前输出尺寸
+        curr_mask = global_mask[:, :, :H, :W]
+        
+        # --- 1. 提取所有 Patches ---
+        base_patches, gt_patches, mask_patches, coords = [], [], [], []
+        for y in range(0, H - grid_size + 1, stride):
+            for x in range(0, W - grid_size + 1, stride):
+                base_patches.append(base_output[:, :, y:y+grid_size, x:x+grid_size])
+                gt_patches.append(targets[:, :, y:y+grid_size, x:x+grid_size])
+                mask_patches.append(curr_mask[:, :, y:y+grid_size, x:x+grid_size]) # 提取掩码块
+                coords.append((y, x))
+        
+        all_base = torch.cat(base_patches, dim=0) 
+        all_gt = torch.cat(gt_patches, dim=0)
+        all_mask = torch.cat(mask_patches, dim=0) # [N, 1, 30, 30]
+
+        # --- 2. 带掩码的小批量迭代微调 ---
+        adapter.train()
+        inner_batch_size = 128 
+        num_patches = all_base.size(0)
+
+        for iteration in range(num_iterations):
+            indices = torch.randperm(num_patches)
+            for start_idx in range(0, num_patches, inner_batch_size):
+                end_idx = min(start_idx + inner_batch_size, num_patches)
+                batch_indices = indices[start_idx:end_idx]
+                
+                b_in = all_base[batch_indices]
+                b_gt = all_gt[batch_indices]
+                b_mask = all_mask[batch_indices] # 获取当前批次的掩码
+
+                optimizer.zero_grad()
+                adjusted = adapter(b_in)
+                
+                # --- Loss 屏蔽海洋区域 ---
+                # 只计算 b_mask == 1 的位置
+                mask_bool = (b_mask > 0.5) 
+                if mask_bool.sum() > 0: # 确保当前批次有陆地
+                    loss_mse = torch.nn.functional.mse_loss(adjusted[mask_bool], b_gt[mask_bool])
+                    loss_l1 = torch.nn.functional.l1_loss(adjusted[mask_bool], b_gt[mask_bool])
+                    penalty_under = torch.mean(torch.relu(-adjusted[mask_bool])**2) # 针对陆地像素，惩罚小于 0 的值
+                    penalty_over = torch.mean(torch.relu(adjusted[mask_bool] - 1.0)**2) # 针对陆地像素，惩罚大于 1 的值
+                    
+                    total_loss = 10.0 * loss_mse + 2.0 * loss_l1 + 10.0 * (penalty_under + penalty_over)
+                    total_loss.backward()
+                    optimizer.step()
+
+        # --- 3. 融合 ---
+        adapter.eval()
+        with torch.no_grad():
+            combined_output = torch.zeros_like(base_output)
+            weight_sum = torch.zeros_like(base_output)
+            
+            refined_list = []
+            for i in range(0, num_patches, inner_batch_size):
+                end_i = min(i + inner_batch_size, num_patches)
+                refined_list.append(adapter(all_base[i:end_i]))
+            refined_patches = torch.cat(refined_list, dim=0)
+            
+            for i, (y, x) in enumerate(coords):
+                patch_to_add = refined_patches[i:i+1] 
+                combined_output[0:1, :, y:y+grid_size, x:x+grid_size] += patch_to_add * fusion_mask
+                weight_sum[0:1, :, y:y+grid_size, x:x+grid_size] += fusion_mask
+
+            final_output = torch.where(weight_sum > 0, combined_output / weight_sum, base_output)
+            
+            # --- 4. 预测后处理：强制归零海洋（防止微小抖动） ---
+            final_output = final_output * curr_mask 
+
+            # --- 5. 保存结果 ---
+            final_output_np = final_output.cpu().numpy()
+            targets_np = targets.cpu().numpy()
+            # 同样对 targets 做掩码，确保计算 MAE 时也是陆地
+            targets_masked_np = targets_np * curr_mask.cpu().numpy()
+            
+            for i in range(final_output_np.shape[0]):
+                base_name = os.path.basename(file_path[i]).replace('.npy', '')
+                
+                save_path_pred = os.path.join(output_dir, f"{base_name}_pred.npy")
+                np.save(save_path_pred, final_output_np[i])
+                
+                # 传入 mask_path 进行绘图过滤
+                save_residual_map(
+                    prediction=final_output_np[i], 
+                    ground_truth=targets_masked_np[i], 
+                    output_dir=output_dir, 
+                    base_name=base_name
+                )
+
+                save_residual_distribution(
+                    prediction=final_output_np[i], 
+                    ground_truth=targets_masked_np[i], 
+                    output_dir=output_dir, 
+                    base_name=base_name,
+                    mask_path=mask_path
+                )
+                
+                file_paths.append(file_path[i])
+                predictions.append(final_output_np[i])
+
+            # 打印陆地 MAE
+            land_mask_idx = (curr_mask.cpu().numpy() > 0.5)
+            if land_mask_idx.any():
+                batch_mae = np.abs(final_output_np[land_mask_idx] - targets_np[land_mask_idx]).mean()
+                print(f"Batch {batch_idx} | Land MAE: {batch_mae:.6f}")
+
+    return predictions, file_paths
+
+def run_inference_with_time_adapter(
+        model,
+        dataloader,
+        device,
+        output_dir,
+        denormalize_output=True,
+        stats=None, 
+        adapter=None,
+        grid_size=30,
+        num_iterations=50, # 有了时序先验，迭代次数可以适当减少
+        mask_path='datasets/AWI-CM-1-1-MR/mask.npy'
+        ):
+    
+    os.makedirs(output_dir, exist_ok=True)
+    predictions, file_paths = [], []
+    optimizer = torch.optim.Adam(adapter.parameters(), lr=2e-3)
+
+    # --- 1. 初始化资源 ---
+    global_mask_np = np.load(mask_path)
+    global_mask = torch.from_numpy(global_mask_np).float().to(device).unsqueeze(0).unsqueeze(0)
+    
+    # 这一步很关键：初始化“前一月残差”为全 0
+    prev_residual = None 
+
+    stride = grid_size // 2  
+    fusion_mask = torch.ones((1, 1, grid_size, grid_size)).to(device)
+    for i in range(grid_size):
+        dist = min(i, grid_size - 1 - i) / (grid_size // 2)
+        fusion_mask[:, :, i, :] *= dist
+        fusion_mask[:, :, :, i] *= dist
+    fusion_mask = torch.clamp(fusion_mask, min=0.1) 
+
+    model.eval()
+    
+    # 注意：dataloader 必须 shuffle=False 以保证时间连续
+    for batch_idx, (features, targets, file_path) in enumerate(tqdm(dataloader, desc="Time-Linked Refining")):
+        features = features.to(device)
+        targets = targets.to(device).unsqueeze(1) if targets.dim() == 3 else targets.to(device)
+        
+        with torch.no_grad():
+            base_output = model(features)
+            if base_output.dim() == 3: base_output = base_output.unsqueeze(1)
+            base_output = base_output.detach().float()
+
+        B, C, H, W = base_output.shape
+        curr_mask = global_mask[:, :, :H, :W]
+        
+        # 如果是第一个月，初始化 prev_residual 为全 0
+        if prev_residual is None:
+            prev_residual = torch.zeros_like(base_output)
+        
+        # --- 2. 提取 Patches (增加 prev_res_patches) ---
+        base_patches, gt_patches, mask_patches, res_patches, coords = [], [], [], [], []
+        for y in range(0, H - grid_size + 1, stride):
+            for x in range(0, W - grid_size + 1, stride):
+                base_patches.append(base_output[:, :, y:y+grid_size, x:x+grid_size])
+                gt_patches.append(targets[:, :, y:y+grid_size, x:x+grid_size])
+                mask_patches.append(curr_mask[:, :, y:y+grid_size, x:x+grid_size])
+                # 提取上个月在该位置的残差块
+                res_patches.append(prev_residual[:, :, y:y+grid_size, x:x+grid_size])
+                coords.append((y, x))
+        
+        all_base = torch.cat(base_patches, dim=0) 
+        all_gt = torch.cat(gt_patches, dim=0)
+        all_mask = torch.cat(mask_patches, dim=0)
+        all_prev_res = torch.cat(res_patches, dim=0)
+
+        # --- 3. 迭代微调 (Adapter 输入：当前预测 + 上月残差) ---
+        adapter.train()
+        inner_batch_size = 128 
+        num_patches = all_base.size(0)
+
+        for iteration in range(num_iterations):
+            indices = torch.randperm(num_patches)
+            for start_idx in range(0, num_patches, inner_batch_size):
+                batch_indices = indices[start_idx : min(start_idx + inner_batch_size, num_patches)]
+                
+                b_in = all_base[batch_indices]
+                b_gt = all_gt[batch_indices]
+                b_mask = all_mask[batch_indices]
+                b_prev_res = all_prev_res[batch_indices]
+
+                optimizer.zero_grad()
+                
+                # --- 核心改变：Adapter 接收两个输入 ---
+                # 假设你的 Adapter forward 已经改为接收 (x, residual)
+                # 或者你将它们 cat 在一起：adapter(torch.cat([b_in, b_prev_res], dim=1))
+                adjusted = adapter(b_in, b_prev_res)
+                
+                mask_bool = (b_mask > 0.5) 
+                if mask_bool.sum() > 0:
+                    loss_mse = torch.nn.functional.mse_loss(adjusted[mask_bool], b_gt[mask_bool])
+                    loss_l1 = torch.nn.functional.l1_loss(adjusted[mask_bool], b_gt[mask_bool])
+                    penalty_under = torch.mean(torch.relu(-adjusted[mask_bool])**2)
+                    penalty_over = torch.mean(torch.relu(adjusted[mask_bool] - 1.0)**2)
+                    
+                    total_loss = 10.0 * loss_mse + 2.0 * loss_l1 + 10.0 * (penalty_under + penalty_over)
+                    total_loss.backward()
+                    optimizer.step()
+
+        # --- 4. 推理与融合 ---
+        adapter.eval()
+        with torch.no_grad():
+            combined_output = torch.zeros_like(base_output)
+            weight_sum = torch.zeros_like(base_output)
+            
+            refined_list = []
+            for i in range(0, num_patches, inner_batch_size):
+                end_i = min(i + inner_batch_size, num_patches)
+                # 推理时也要输入 prev_residual
+                refined_list.append(adapter(all_base[i:end_i], all_prev_res[i:end_i]))
+            
+            refined_patches = torch.cat(refined_list, dim=0)
+            for i, (y, x) in enumerate(coords):
+                combined_output[0:1, :, y:y+grid_size, x:x+grid_size] += refined_patches[i:i+1] * fusion_mask
+                weight_sum[0:1, :, y:y+grid_size, x:x+grid_size] += fusion_mask
+
+            final_output = torch.where(weight_sum > 0, combined_output / weight_sum, base_output)
+            final_output = final_output * curr_mask # 掩码过滤
+
+            # --- 5. 更新时序状态：保存当前残差供下个月使用 ---
+            # 残差 = 预测 - 真值
+            # 必须使用 .detach() 彻底切断计算图，防止内存随时间累积
+            prev_residual = (final_output - targets).detach()
+
+            # --- 6. 保存与绘图 (逻辑同前) ---
+            final_output_np = final_output.cpu().numpy()
+            targets_masked_np = (targets * curr_mask).cpu().numpy()
+            
+            base_name = os.path.basename(file_path[0]).replace('.npy', '')
+            np.save(os.path.join(output_dir, f"{base_name}_pred.npy"), final_output_np[0])
+            
+            save_residual_map(final_output_np[0], targets_masked_np[0], output_dir, base_name)
+            save_residual_distribution(final_output_np[0], targets_masked_np[0], output_dir, base_name, mask_path)
+            
+            file_paths.append(file_path[0])
+            predictions.append(final_output_np[0])
+
+    return predictions, file_paths
+
+def run_inference_with_multi_history(
+    model, dataloader, device, output_dir,
+    adapter=None, grid_size=30, mask_path='datasets/AWI-CM-1-1-MR/mask.npy',
+    window_size=3, early_stop_threshold=1e-6, patience=10,  # Set the early stop threshold and patience value
+    save_adapter=True,  # New addition: Whether to save the weights
+    checkpoint_freq=None  # New addition: How often to save the intermediate results for each batch? None indicates that only the final results will be saved.
+):
+    os.makedirs(output_dir, exist_ok=True)
+    predictions, file_paths = [], []
+    optimizer = torch.optim.Adam(adapter.parameters(), lr=1e-3)
+
+    # Load global mask
+    global_mask_np = np.load(mask_path)
+    global_mask = torch.from_numpy(global_mask_np).float().to(device).unsqueeze(0).unsqueeze(0)
+
+    # Initialize the sliding window queue (with a fixed length of N)
+    res_queue = deque([None] * window_size, maxlen=window_size)
+
+    # Blending Mask Generation (Maintaining Smooth Transition)
+    stride = grid_size // 2
+    fusion_mask = torch.ones((1, 1, grid_size, grid_size)).to(device)
+    for i in range(grid_size):
+        dist = min(i, grid_size - 1 - i) / (grid_size // 2)
+        fusion_mask[:, :, i, :] *= dist
+        fusion_mask[:, :, :, i] *= dist
+    fusion_mask = torch.clamp(fusion_mask, min=0.1)
+
+    model.eval()
+
+    # Variables for monitoring changes in losses
+    prev_loss = float('inf')  # The previous round's losses
+    patience_counter = 0  # Record the number of consecutive times that the loss has not decreased
+    best_loss = prev_loss  # The best loss
+    iteration = 0
+
+    for batch_idx, (features, targets, file_path) in enumerate(tqdm(dataloader, desc="N-Step History Refining")):
+        features, targets = features.to(device), targets.to(device)
+        if targets.dim() == 3:
+            targets = targets.unsqueeze(1)
+
+        with torch.no_grad():
+            base_output = model(features)
+            if base_output.dim() == 3:
+                base_output = base_output.unsqueeze(1)
+            base_output = base_output.detach().float()
+
+        B, C, H, W = base_output.shape
+        curr_mask = global_mask[:, :, :H, :W]
+
+        # Prepare an N-month historical residual tensor
+        history_list = []
+        for r in res_queue:
+            if r is None:
+                history_list.append(torch.zeros_like(base_output))  # Zero filling
+            else:
+                history_list.append(r)
+        # Joined shape: [B, window_size, H, W]
+        combined_history = torch.cat(history_list, dim=1)
+
+        #  Chunk extraction
+        base_patches, gt_patches, mask_patches, hist_patches, coords = [], [], [], [], []
+        for y in range(0, H - grid_size + 1, stride):
+            for x in range(0, W - grid_size + 1, stride):
+                base_patches.append(base_output[:, :, y:y+grid_size, x:x+grid_size])
+                gt_patches.append(targets[:, :, y:y+grid_size, x:x+grid_size])
+                mask_patches.append(curr_mask[:, :, y:y+grid_size, x:x+grid_size])
+                hist_patches.append(combined_history[:, :, y:y+grid_size, x:x+grid_size])
+                coords.append((y, x))
+
+        all_base = torch.cat(base_patches, dim=0)
+        all_gt = torch.cat(gt_patches, dim=0)
+        all_mask = torch.cat(mask_patches, dim=0)
+        all_hist = torch.cat(hist_patches, dim=0)
+
+        # Iterative fine-tuning / Online assimilation (with early stopping)
+        adapter.train()
+        inner_batch_size = 3072
+        num_patches = all_base.size(0)
+
+        for _ in range(100):  # Maximum number of iterations
+            indices = torch.randperm(num_patches)
+            for start_idx in range(0, num_patches, inner_batch_size):
+                idx = indices[start_idx : start_idx + inner_batch_size]
+
+                optimizer.zero_grad()
+                adjusted = adapter(all_base[idx], all_hist[idx])
+
+                mask_bool = (all_mask[idx] > 0.5)
+                if mask_bool.any():
+                    loss_mse = F.mse_loss(adjusted[mask_bool], all_gt[idx][mask_bool])
+                    loss_l1 = F.l1_loss(adjusted[mask_bool], all_gt[idx][mask_bool])
+                    penalty = torch.mean(torch.relu(-adjusted[mask_bool])**2) + \
+                              torch.mean(torch.relu(adjusted[mask_bool] - 1.0)**2)
+
+                    loss = 10.0 * loss_mse + 2.0 * loss_l1 + 10.0 * penalty
+                    loss.backward()
+                    optimizer.step()
+
+                    # Determine whether the change in losses has reached the threshold
+                    if abs(prev_loss - loss.item()) < early_stop_threshold:
+                        patience_counter += 1  # There have been no significant changes for several consecutive times
+                    else:
+                        patience_counter = 0  # If the loss shows significant changes, then reset the counter
+
+                    prev_loss = loss.item()
+
+                    # 如果连续一定次数没有显著下降，进行早停
+                    if patience_counter >= patience:
+                        print(f"Early stopping at iteration {iteration} with patience {patience}")
+                        break
+
+            iteration += 1
+            if patience_counter >= patience:
+                break
+
+        # Reasoning and update the sequence
+        adapter.eval()
+        with torch.no_grad():
+            combined_output = torch.zeros_like(base_output)
+            weight_sum = torch.zeros_like(base_output)
+
+            for i in range(0, num_patches, inner_batch_size):
+                end_i = min(i + inner_batch_size, num_patches)
+                refined_p = adapter(all_base[i:end_i], all_hist[i:end_i])
+
+                for j in range(refined_p.size(0)):
+                    y, x = coords[i + j]
+                    combined_output[:, :, y:y+grid_size, x:x+grid_size] += refined_p[j:j+1] * fusion_mask
+                    weight_sum[:, :, y:y+grid_size, x:x+grid_size] += fusion_mask
+
+            final_output = torch.where(weight_sum > 0, combined_output / weight_sum, base_output)
+            final_output = torch.clamp(final_output * curr_mask, 0.0, 1.0)
+
+            # Update historical queue: Add the actual residuals for the current month (Refined - GroundTruth)
+            current_residual = (final_output - targets).detach()
+            res_queue.append(current_residual)
+
+            # Save and plotting
+            final_output_np = final_output.cpu().numpy()
+            targets_masked_np = (targets * curr_mask).cpu().numpy()
+
+            base_name = os.path.basename(file_path[0]).replace('.npy', '')
+            np.save(os.path.join(output_dir, f"{base_name}_pred.npy"), final_output_np[0])
+
+            save_residual_map(final_output_np[0], targets_masked_np[0], output_dir, base_name)
+            save_residual_distribution(final_output_np[0], targets_masked_np[0], output_dir, base_name, mask_path)
+
+            file_paths.append(file_path[0])
+            predictions.append(final_output_np[0])
+
+            # New: Regularly save intermediate weights
+            if save_adapter and checkpoint_freq is not None and (batch_idx + 1) % checkpoint_freq == 0:
+                ckpt_path = os.path.join(output_dir, f"adapter_checkpoint_batch{batch_idx}.pt")
+                torch.save({
+                    'batch_idx': batch_idx,
+                    'model_state_dict': adapter.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'res_queue': list(res_queue),  # Save the sequence status
+                    'loss': prev_loss,
+                }, ckpt_path)
+                print(f"Saved intermediate checkpoint to {ckpt_path}")
+
+            # New: save the final weights
+            if save_adapter:
+                final_path = os.path.join(output_dir, "final_adapter.pt")
+                torch.save({
+                    'model_state_dict': adapter.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),  # If need to continue training
+                    'window_size': window_size,
+                    'final_res_queue': list(res_queue),  # Final historical state
+                    'num_batches': len(predictions),
+                }, final_path)
+                print(f"\n✓ Final adapter weights saved to: {final_path}")
+                
+                # Save the pure Adapter's model weights (for ease of deployment)
+                torch.save(adapter.state_dict(), os.path.join(output_dir, "final_adapter_weights_only.pt"))
+
+    return predictions, file_paths
+

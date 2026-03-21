@@ -59,7 +59,10 @@ def get_npy_files(directory):
 def filter_files_by_date(file_dict, date_format="%Y%m", start_date="201501", end_date=None, mode='after'):
     """
     Filter files by date
-    mode: 'after' - files after start_date, 'before' - files before end_date
+    mode: 
+        - 'after': files after start_date
+        - 'before': files before end_date
+        - 'between': files between start_date and end_date (inclusive)
     """
     if mode == 'after':
         cutoff = datetime.strptime(start_date, date_format)
@@ -85,8 +88,24 @@ def filter_files_by_date(file_dict, date_format="%Y%m", start_date="201501", end
                         filtered[category].append(fp)
                 except ValueError:
                     continue
+    elif mode == 'between':
+        if start_date is None or end_date is None:
+            raise ValueError("mode='between' requires both start_date and end_date")
+        start_cutoff = datetime.strptime(start_date, date_format)
+        end_cutoff = datetime.strptime(end_date, date_format)
+        filtered = {}
+        for category, files in file_dict.items():
+            filtered[category] = []
+            for fp in files:
+                date_str = os.path.basename(fp).split('.')[0][-6:]
+                try:
+                    file_date = datetime.strptime(date_str, date_format)
+                    if start_cutoff <= file_date <= end_cutoff:
+                        filtered[category].append(fp)
+                except ValueError:
+                    continue
     else:
-        raise ValueError("mode must be 'after' or 'before'")
+        raise ValueError("mode must be 'after', 'before', or 'between'")
     
     return filtered
 
